@@ -195,6 +195,9 @@ class AgentLoop:
                 max_tokens=self.max_tokens,
             )
 
+            if response.finish_reason == "error":
+                raise RuntimeError(response.content)
+
             if response.has_tool_calls:
                 if on_progress:
                     clean = self._strip_think(response.content)
@@ -264,7 +267,7 @@ class AgentLoop:
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel,
                         chat_id=msg.chat_id,
-                        content=f"Sorry, I encountered an error: {str(e)}"
+                        content="I ran into a temporary issue. Please try again in a moment."
                     ))
             except asyncio.TimeoutError:
                 continue
