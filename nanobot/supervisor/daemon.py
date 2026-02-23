@@ -168,62 +168,6 @@ async def _restart_gateway() -> str:
         return "restart failed: nanobot not found in PATH"
 
 
-def _edit_config(patch: dict) -> str:
-    """Apply *patch* dict to ~/.nanobot/config.json."""
-    config_path = Path.home() / ".nanobot" / "config.json"
-    if not config_path.exists():
-        return "edit_config failed: config.json not found"
-
-    with open(config_path, encoding="utf-8") as fh:
-        data = json.load(fh)
-
-    def _deep_update(base: dict, updates: dict) -> None:
-        for k, v in updates.items():
-            if isinstance(v, dict) and isinstance(base.get(k), dict):
-                _deep_update(base[k], v)
-            else:
-                base[k] = v
-
-    _deep_update(data, patch)
-
-    with open(config_path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, ensure_ascii=False)
-
-    return f"config updated: {list(patch.keys())}"
-
-
-def _patch_file(file_path: str, old_string: str, new_string: str) -> str:
-    """Replace *old_string* with *new_string* in the given file."""
-    if not file_path:
-        return "patch_file failed: no file path provided"
-
-    path = Path(file_path).expanduser()
-    if not path.exists():
-        return f"patch_file failed: {path} not found"
-
-    content = path.read_text(encoding="utf-8")
-    if old_string not in content:
-        return f"patch_file failed: old_string not found in {path}"
-
-    path.write_text(content.replace(old_string, new_string, 1), encoding="utf-8")
-    return f"patched {path}"
-
-
-def _edit_workspace(workspace: Path, relative_file: str, content: str) -> str:
-    """Write *content* to a file inside the workspace directory."""
-    if not relative_file:
-        return "edit_workspace failed: no file path provided"
-
-    # Sandbox: ensure path stays within workspace
-    target = (workspace / relative_file).resolve()
-    if not str(target).startswith(str(workspace.resolve())):
-        return f"edit_workspace rejected: {relative_file} is outside workspace"
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8")
-    return f"wrote {target}"
-
-
 # ---------------------------------------------------------------------------
 # Audit Logger — append entries to SUPERVISOR_LOG.md
 # ---------------------------------------------------------------------------
