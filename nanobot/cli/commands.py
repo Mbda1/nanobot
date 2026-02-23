@@ -1150,5 +1150,147 @@ def supervisor(
     asyncio.run(run_supervisor(config, verbose=verbose))
 
 
+# ============================================================================
+# Process Control — stop / start / restart agents
+# ============================================================================
+
+_AGENT_PATTERNS = {
+    "gateway":    "nanobot gateway",
+    "supervisor": "nanobot supervisor",
+}
+
+
+def _find_pids(pattern: str) -> list[int]:
+    """Return PIDs of processes whose command line contains *pattern*."""
+    import subprocess
+    result = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
+    return [int(p) for p in result.stdout.splitlines() if p.strip()]
+
+
+def _kill_agent(name: str) -> list[int]:
+    """SIGTERM all processes matching *name*. Returns killed PIDs."""
+    import signal as _signal
+    pids = _find_pids(_AGENT_PATTERNS[name])
+    for pid in pids:
+        try:
+            os.kill(pid, _signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    return pids
+
+
+def _start_agent(name: str) -> int | None:
+    """Start *name* as a detached background process. Returns PID or None."""
+    import subprocess
+    nanobot_bin = shutil.which("nanobot")
+    if not nanobot_bin:
+        return None
+    proc = subprocess.Popen(
+        [nanobot_bin, name],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return proc.pid
+
+
+@app.command(name="ps")
+def agent_ps():
+    """Show running nanobot agents (gateway, supervisor)."""
+    import subprocess
+    any_running = False
+    for name, pattern in _AGENT_PATTERNS.items():
+        pids = _find_pids(pattern)
+        if pids:
+            any_running = True
+            console.print(f"[green]●[/green] {name:<12} PIDs: {', '.join(str(p) for p in pids)}")
+        else:
+            console.print(f"[dim]○[/dim] {name:<12} [dim]not running[/dim]")
+    if not any_running:
+        console.print("[yellow]No agents running.[/yellow]")
+
+
+@app.command(name="stop")
+def agent_stop(
+    agents: list[str] = typer.Argument(None, help="Agents to stop: gateway, supervisor, or all (default: all)"),
+):
+    """Stop nanobot agents. Use before making code changes."""
+    targets = agents if agents else list(_AGENT_PATTERNS.keys())
+    invalid = [a for a in targets if a not in _AGENT_PATTERNS and a != "all"]
+    if invalid:
+        console.print(f"[red]Unknown agents: {', '.join(invalid)}. Choose from: {', '.join(_AGENT_PATTERNS)}[/red]")
+        raise typer.Exit(1)
+    if "all" in targets:
+        targets = list(_AGENT_PATTERNS.keys())
+
+    import time
+    for name in targets:
+        pids = _kill_agent(name)
+        if pids:
+            console.print(f"[yellow]↓[/yellow] Stopped {name} (PID {', '.join(str(p) for p in pids)})")
+        else:
+            console.print(f"[dim]○[/dim] {name} was not running")
+
+    time.sleep(1)
+    console.print("[green]Done.[/green] Safe to make code changes.")
+
+
+@app.command(name="start")
+def agent_start(
+    agents: list[str] = typer.Argument(None, help="Agents to start: gateway, supervisor, or all (default: all)"),
+):
+    """Start nanobot agents."""
+    import shutil, time
+    targets = agents if agents else list(_AGENT_PATTERNS.keys())
+    invalid = [a for a in targets if a not in _AGENT_PATTERNS and a != "all"]
+    if invalid:
+        console.print(f"[red]Unknown agents: {', '.join(invalid)}. Choose from: {', '.join(_AGENT_PATTERNS)}[/red]")
+        raise typer.Exit(1)
+    if "all" in targets:
+        targets = list(_AGENT_PATTERNS.keys())
+
+    for name in targets:
+        existing = _find_pids(_AGENT_PATTERNS[name])
+        if existing:
+            console.print(f"[dim]○[/dim] {name} already running (PID {', '.join(str(p) for p in existing)})")
+            continue
+        pid = _start_agent(name)
+        if pid:
+            console.print(f"[green]↑[/green] Started {name} (PID {pid})")
+        else:
+            console.print(f"[red]✗[/red] Failed to start {name} — is nanobot in PATH?")
+
+    time.sleep(2)
+    console.print("[green]Done.[/green]")
+
+
+@app.command(name="restart")
+def agent_restart(
+    agents: list[str] = typer.Argument(None, help="Agents to restart: gateway, supervisor, or all (default: all)"),
+):
+    """Restart nanobot agents (stop then start)."""
+    import time
+    targets = agents if agents else list(_AGENT_PATTERNS.keys())
+    if "all" in targets:
+        targets = list(_AGENT_PATTERNS.keys())
+
+    for name in targets:
+        pids = _kill_agent(name)
+        if pids:
+            console.print(f"[yellow]↓[/yellow] Stopped {name}")
+
+    time.sleep(2)
+
+    for name in targets:
+        pid = _start_agent(name)
+        if pid:
+            console.print(f"[green]↑[/green] Started {name} (PID {pid})")
+        else:
+            console.print(f"[red]✗[/red] Failed to start {name}")
+
+    time.sleep(2)
+    console.print("[green]Done.[/green]")
+
+
 if __name__ == "__main__":
     app()
