@@ -290,7 +290,21 @@ def gateway(
     if verbose:
         import logging
         logging.basicConfig(level=logging.DEBUG)
-    
+
+    # Set up persistent log file for supervisor
+    from loguru import logger as _logger
+    _log_dir = get_data_dir() / "logs"
+    _log_dir.mkdir(parents=True, exist_ok=True)
+    _log_file = _log_dir / "nanobot.log"
+    _logger.enable("nanobot")
+    _logger.add(
+        str(_log_file),
+        rotation="10 MB",
+        retention="7 days",
+        level="DEBUG",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {name}:{line} - {message}",
+    )
+
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
     
     config = load_config()
@@ -454,6 +468,7 @@ def agent(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
+        local_model=config.agents.defaults.local_model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
@@ -945,6 +960,7 @@ def cron_run(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
+        local_model=config.agents.defaults.local_model,
         temperature=config.agents.defaults.temperature,
         max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
@@ -1107,6 +1123,31 @@ def _login_github_copilot() -> None:
     except Exception as e:
         console.print(f"[red]Authentication error: {e}[/red]")
         raise typer.Exit(1)
+
+
+# ============================================================================
+# Supervisor Command
+# ============================================================================
+
+
+@app.command()
+def supervisor(
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show supervisor logs in stdout"),
+):
+    """Run the supervisor daemon — monitors nanobot logs and applies autonomous fixes."""
+    from nanobot.config.loader import load_config, get_data_dir
+    from nanobot.supervisor.daemon import run_supervisor
+
+    config = load_config()
+    log_file = get_data_dir() / "logs" / "nanobot.log"
+    audit_log = config.workspace_path / "memory" / "SUPERVISOR_LOG.md"
+
+    console.print("[bold cyan]NanoSupervisor starting...[/bold cyan]")
+    console.print(f"  Watching:  {log_file}")
+    console.print(f"  Audit log: {audit_log}")
+    console.print("  (start 'nanobot gateway' in another terminal if not already running)\n")
+
+    asyncio.run(run_supervisor(config, verbose=verbose))
 
 
 if __name__ == "__main__":
