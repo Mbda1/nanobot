@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+from pathlib import Path
 from loguru import logger
 from telegram import BotCommand, Update, ReplyParameters
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -126,6 +128,114 @@ class TelegramChannel(BaseChannel):
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
+        self._pending_file = Path.home() / ".nanobot" / "workspace" / "pending_tweets.json"
+        self._pending_tweets: dict[str, dict] = self._load_pending()  # sender_id -> {url, handle}
+
+    # --- Tweet pending state (persisted to disk, survives restarts) ---
+
+    def _load_pending(self) -> dict:
+        try:
+            if self._pending_file.exists():
+                return json.loads(self._pending_file.read_text())
+        except Exception:
+            pass
+        return {}
+
+    def _save_pending(self) -> None:
+        try:
+            self._pending_file.parent.mkdir(parents=True, exist_ok=True)
+            self._pending_file.write_text(json.dumps(self._pending_tweets))
+        except Exception as e:
+            logger.warning("Failed to save pending tweets: {}", e)
+
+    def _set_pending_tweet(self, sender_id: str, url: str, handle: str) -> None:
+        self._pending_tweets[sender_id] = {"url": url, "handle": handle}
+        self._save_pending()
+
+    def _pop_pending_tweet(self, sender_id: str) -> dict | None:
+        pending = self._pending_tweets.pop(sender_id, None)
+        if pending:
+            self._save_pending()
+        return pending
+
+    @staticmethod
+    def _extract_twitter_url(text: str) -> tuple[str, str] | None:
+        """Return (url, handle) if message contains an x.com/twitter.com URL, else None."""
+        m = re.search(r'https?://(?:www\.)?(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)/status/\S+', text)
+        if m:
+            url = m.group(0).split()[0].rstrip('.,)')
+            handle = f"@{m.group(1)}"
+            return url, handle
+        return None
+
+    async def _save_tweet_bookmark(self, chat_id: int, url: str, handle: str, title: str) -> None:
+        """Save tweet bookmark directly to Obsidian and knowledge base — no LLM involved."""
+        import datetime
+        today = datetime.date.today().isoformat()
+
+        # Categorize from title keywords
+        title_lower = title.lower()
+        if any(w in title_lower for w in ("ai", "llm", "model", "agent", "gpt", "openai", "claude",
+                                           "anthropic", "mistral", "gemini", "llama", "perplexity",
+                                           "machine learning", "neural", "robot", "automation", "tech",
+                                           "software", "code", "claw", "nanobot")):
+            category = "ai"
+        elif any(w in title_lower for w in ("stock", "etf", "invest", "market", "fund", "portfolio",
+                                             "finance", "money", "trade", "crypto", "bond", "economy",
+                                             "retire", "saving", "wealth", "real estate")):
+            category = "finance"
+        else:
+            category = "longevity"
+
+        workspace = Path.home() / ".nanobot" / "workspace"
+        obsidian_dir = Path("/mnt/c/Users/Merim/Desktop/Merim_Personal/Bot Notes")
+
+        # Build note content
+        note = (
+            f"---\n"
+            f"date: {today}\n"
+            f"tags: [twitter-bookmark]\n"
+            f"source: twitter\n"
+            f"author: {handle}\n"
+            f"---\n\n"
+            f"# {title}\n\n"
+            f"🔗 [View tweet]({url})\n\n"
+            f"**Source:** {handle} on X\n"
+            f"**Saved:** {today}\n"
+        )
+
+        # Write Obsidian note
+        safe_title = re.sub(r'[<>:"/\\|?*]', '', title)[:80]
+        obsidian_path = obsidian_dir / f"{today} {safe_title}.md"
+        try:
+            obsidian_dir.mkdir(parents=True, exist_ok=True)
+            obsidian_path.write_text(note, encoding="utf-8")
+            logger.info("Tweet bookmark saved to Obsidian: {}", obsidian_path.name)
+        except Exception as e:
+            logger.error("Failed to write Obsidian note: {}", e)
+            await self._app.bot.send_message(chat_id=chat_id, text=f"Error saving to Obsidian: {e}")
+            return
+
+        # Append to knowledge base
+        kb_path = workspace / "knowledge" / f"{category}.md"
+        kb_entry = (
+            f"\n## [{title}]({url})\n"
+            f"*Saved: {today}*\n\n"
+            f"Twitter bookmark — {handle} on X.\n\n"
+            f"---\n"
+        )
+        try:
+            kb_path.parent.mkdir(parents=True, exist_ok=True)
+            existing = kb_path.read_text(encoding="utf-8") if kb_path.exists() else f"# {category.title()} Knowledge Base\n\n---\n"
+            kb_path.write_text(existing + kb_entry, encoding="utf-8")
+            logger.info("Tweet bookmark appended to knowledge/{}.md", category)
+        except Exception as e:
+            logger.error("Failed to write knowledge base: {}", e)
+
+        await self._app.bot.send_message(
+            chat_id=chat_id,
+            text=f"Saved: {handle} — {title}\nObsidian: Bot Notes/{obsidian_path.name}\nKnowledge: {category}.md",
+        )
     
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -393,14 +503,50 @@ class TelegramChannel(BaseChannel):
                 content_parts.append(f"[{media_type}: download failed]")
         
         content = "\n".join(content_parts) if content_parts else "[empty message]"
-        
+
         logger.debug("Telegram message from {}: {}...", sender_id, content[:50])
-        
+
         str_chat_id = str(chat_id)
-        
+
+        # --- Twitter/X.com state machine (deterministic, no LLM involved) ---
+        twitter_match = self._extract_twitter_url(content)
+
+        if twitter_match:
+            url, handle = twitter_match
+            # Strip the URL from content to check if there's a title alongside it
+            title_text = content.replace(url, "").strip()
+            if title_text:
+                # URL + title in same message → save directly, no LLM
+                logger.info("Tweet with inline title from {}: '{}'", sender_id, title_text)
+                await self._save_tweet_bookmark(chat_id, url, handle, title_text)
+                return
+            else:
+                # URL only → store pending, ask for title directly, no LLM
+                self._set_pending_tweet(sender_id, url, handle)
+                logger.info("Tweet URL stored as pending for {}: {}", sender_id, handle)
+                try:
+                    await self._app.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"What should I title this {handle} tweet?",
+                    )
+                except Exception as e:
+                    logger.error("Failed to send tweet prompt: {}", e)
+                return  # Do NOT forward to LLM
+
+        elif pending := self._pop_pending_tweet(sender_id):
+            # Previous message was an X.com URL, this message is the title → save directly, no LLM
+            url = pending["url"]
+            handle = pending["handle"]
+            title = content.strip()
+            logger.info("Tweet title received for pending {}: '{}'", handle, title)
+            await self._save_tweet_bookmark(chat_id, url, handle, title)
+            return
+
+        # --- End Twitter state machine ---
+
         # Start typing indicator before processing
         self._start_typing(str_chat_id)
-        
+
         # Forward to the message bus
         await self._handle_message(
             sender_id=sender_id,
