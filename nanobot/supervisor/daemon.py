@@ -60,15 +60,18 @@ async def detect_issues(lines: list[str]) -> list[dict]:
         "You are a nanobot supervisor. Analyze the following log lines for errors or issues.\n"
         "Return a JSON array of issues with fields:\n"
         "  description (str), severity (critical|warning|info),\n"
-        "  fix_type (restart_gateway|edit_config|patch_file|edit_workspace|none),\n"
-        "  fix_details (dict with keys depending on fix_type).\n"
+        "  fix_type (restart_gateway|suggest|none),\n"
+        "  fix_details (dict).\n"
         "\n"
-        "fix_details schema per fix_type:\n"
+        "fix_type rules:\n"
+        "  restart_gateway — ONLY if the gateway process has crashed or is unresponsive.\n"
+        "  suggest          — for any other issue: describe what a human should do in fix_details.suggestion.\n"
+        "  none             — if no action is needed.\n"
+        "\n"
+        "fix_details schema:\n"
         "  restart_gateway: {}\n"
-        "  edit_config: {\"patch\": {<key>: <value>, ...}}\n"
-        "  patch_file: {\"file\": \"<abs_path>\", \"old_string\": \"...\", \"new_string\": \"...\"}\n"
-        "  edit_workspace: {\"file\": \"<relative_path_in_workspace>\", \"content\": \"...\"}\n"
-        "  none: {}\n"
+        "  suggest:         {\"suggestion\": \"<human-readable action to take>\"}\n"
+        "  none:            {}\n"
         "\n"
         "Return [] if no actionable issues found.\n"
         "Return ONLY valid JSON, no markdown fences, no commentary."
@@ -110,26 +113,17 @@ async def apply_fix(issue: dict, config, workspace: Path) -> str:
     fix_type = issue.get("fix_type", "none")
     details = issue.get("fix_details", {}) or {}
 
+    # Hard allowlist — only gateway restart is autonomous; everything else is suggestion-only
+    _ALLOWED_AUTO = {"restart_gateway"}
+
+    if fix_type not in _ALLOWED_AUTO:
+        suggestion = details.get("suggestion", issue.get("description", "no details"))
+        logger.info(f"[supervisor] blocked fix_type={fix_type!r} — suggestion: {suggestion}")
+        return f"suggestion (not auto-applied): {suggestion}"
+
     try:
         if fix_type == "restart_gateway":
             return await _restart_gateway()
-
-        if fix_type == "edit_config":
-            return _edit_config(details.get("patch", {}))
-
-        if fix_type == "patch_file":
-            return _patch_file(
-                details.get("file", ""),
-                details.get("old_string", ""),
-                details.get("new_string", ""),
-            )
-
-        if fix_type == "edit_workspace":
-            return _edit_workspace(
-                workspace,
-                details.get("file", ""),
-                details.get("content", ""),
-            )
 
         return "no fix applied"
 
@@ -384,15 +378,17 @@ async def run_supervisor(config, verbose: bool = False) -> None:
             if buffer:
                 issues = await detect_issues(buffer)
                 for issue in issues:
-                    if issue.get("fix_type", "none") == "none":
+                    fix_type = issue.get("fix_type", "none")
+                    if fix_type == "none":
                         continue
                     result = await apply_fix(issue, config, workspace)
                     await write_audit(issue, result, workspace)
-                    if issue.get("severity") in ("critical", "warning"):
+                    # Notify on auto-fixes AND suggestions so nothing is silent
+                    if issue.get("severity") in ("critical", "warning") or fix_type == "suggest":
                         await notify_telegram(issue, result, config)
                         logger.info(
-                            f"[supervisor] {issue.get('severity').upper()} — "
-                            f"{issue.get('description')} — fix: {result}"
+                            f"[supervisor] {issue.get('severity', 'info').upper()} — "
+                            f"{issue.get('description')} — {result}"
                         )
             buffer = []
             last_flush = time.monotonic()

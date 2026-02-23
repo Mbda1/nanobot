@@ -1181,7 +1181,7 @@ def _kill_agent(name: str) -> list[int]:
 
 def _start_agent(name: str) -> int | None:
     """Start *name* as a detached background process. Returns PID or None."""
-    import subprocess
+    import subprocess, shutil
     nanobot_bin = shutil.which("nanobot")
     if not nanobot_bin:
         return None
