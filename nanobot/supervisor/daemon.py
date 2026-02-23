@@ -77,7 +77,7 @@ async def detect_issues(lines: list[str]) -> list[dict]:
     try:
         response = await litellm.acompletion(
             model="ollama/mistral",
-            api_base="http://localhost:11434",
+            api_base="http://host.docker.internal:11434",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": batch_text},

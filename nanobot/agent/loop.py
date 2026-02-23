@@ -478,7 +478,7 @@ class AgentLoop:
                         {"role": "system", "content": system},
                         {"role": "user", "content": stripped},
                     ],
-                    api_base="http://localhost:11434",
+                    api_base="http://host.docker.internal:11434",
                     max_tokens=300,
                     temperature=0.2,
                 ),
