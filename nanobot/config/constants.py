@@ -37,6 +37,12 @@ OLLAMA_KEEP_ALIVE     = -1
 # --- Limits ---
 TOOL_RESULT_MAX_CHARS = 500    # tool output truncation    (loop.py)
 
+# --- Memory tiering ---
+# MEMORY.md is capped at this many lines (hot tier).
+# When exceeded, the oldest ## section is moved to memory/topics/<slug>.md (warm tier).
+# Warm-tier files are keyword-matched against the user's message and loaded on demand.
+MEMORY_HOT_MAX_LINES = 200
+
 # --- Circuit breakers (loop.py) ---
 # Trip when the same tool is called more than this many times in one turn.
 CIRCUIT_BREAKER_PER_TOOL   = 5

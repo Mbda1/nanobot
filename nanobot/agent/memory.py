@@ -1,8 +1,15 @@
-"""Memory system for persistent agent memory."""
+"""Memory system for persistent agent memory.
+
+Three-tier architecture:
+  Hot  — MEMORY.md: always loaded, capped at MEMORY_HOT_MAX_LINES.
+  Warm — memory/topics/*.md: overflow from hot tier; keyword-matched and loaded on demand.
+  Cold — HISTORY.md: grep-searchable event log; never auto-loaded.
+"""
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -12,6 +19,7 @@ from nanobot.agent.usage import record as _usage_record
 from nanobot.config.constants import (
     MEMORY_CHUNK_SIZE,
     MEMORY_CHUNK_MAX_TOKENS,
+    MEMORY_HOT_MAX_LINES,
     MEMORY_MERGE_MAX_TOKENS,
     TIMEOUT_CHUNK_SUMMARY,
 )
@@ -88,12 +96,25 @@ async def _summarize_chunk(
 
 
 class MemoryStore:
-    """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
+    """Three-tier memory: hot (MEMORY.md) + warm (topics/*.md) + cold (HISTORY.md)."""
+
+    # Words too common to be useful topic keywords.
+    _STOP_WORDS = {
+        "about", "also", "been", "does", "from", "have", "help",
+        "here", "just", "like", "make", "more", "need", "some",
+        "that", "their", "them", "then", "there", "this", "what",
+        "when", "where", "which", "with", "would", "your",
+    }
 
     def __init__(self, workspace: Path):
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
+
+    @property
+    def topics_dir(self) -> Path:
+        """Warm-tier directory (created on first overflow)."""
+        return self.memory_dir / "topics"
 
     def read_long_term(self) -> str:
         if self.memory_file.exists():
@@ -102,14 +123,89 @@ class MemoryStore:
 
     def write_long_term(self, content: str) -> None:
         self.memory_file.write_text(content, encoding="utf-8")
+        self.trim_hot()
+
+    def trim_hot(self) -> None:
+        """Overflow oldest MEMORY.md sections to topics/ when line cap is exceeded."""
+        content = self.read_long_term()
+        if not content or len(content.splitlines()) <= MEMORY_HOT_MAX_LINES:
+            return
+
+        # Split into sections on ## headers, preserving the header with each section.
+        raw = re.split(r"\n(?=## )", content.strip())
+
+        if len(raw) <= 1:
+            # No section headers — trim from the top, keep newest lines.
+            lines = content.splitlines()
+            self.memory_file.write_text("\n".join(lines[-MEMORY_HOT_MAX_LINES:]), encoding="utf-8")
+            logger.info("Memory hot tier: trimmed to {} lines (no headers)", MEMORY_HOT_MAX_LINES)
+            return
+
+        topics = ensure_dir(self.topics_dir)
+        overflowed = False
+
+        while len(raw) > 1 and len("\n\n".join(raw).splitlines()) > MEMORY_HOT_MAX_LINES:
+            oldest = raw.pop(0)
+            overflowed = True
+
+            # Derive a stable slug from the section header.
+            m = re.match(r"## (.+)", oldest.strip())
+            if m:
+                # Strip trailing date stamps like "(2026-02-24 10:40)"
+                base = re.sub(r"\s*\([\d\-: ]+\)", "", m.group(1)).strip()
+                slug = re.sub(r"[^\w\s]", "", base.lower())
+                slug = re.sub(r"\s+", "-", slug.strip())[:50] or "overflow"
+            else:
+                slug = "overflow"
+
+            topic_file = topics / f"{slug}.md"
+            existing = topic_file.read_text(encoding="utf-8").strip() if topic_file.exists() else ""
+            sep = "\n\n" if existing else ""
+            topic_file.write_text(f"{existing}{sep}{oldest.strip()}\n", encoding="utf-8")
+            logger.info("Memory hot→warm: '{}' → topics/{}.md", slug, slug)
+
+        if overflowed:
+            self.memory_file.write_text("\n\n".join(raw).strip() + "\n", encoding="utf-8")
+
+    def _load_warm_topics(self, user_message: str) -> str:
+        """Return content of topic files whose stems keyword-match the user message."""
+        if not user_message or not self.topics_dir.exists():
+            return ""
+
+        words = set(re.findall(r"\b[a-z]{4,}\b", user_message.lower())) - self._STOP_WORDS
+        if not words:
+            return ""
+
+        loaded: list[str] = []
+        for topic_file in sorted(self.topics_dir.glob("*.md")):
+            # Topic keywords come from the file stem (e.g. "car-garage" → {"garage"})
+            stem_words = set(re.findall(r"\b[a-z]{4,}\b", topic_file.stem.lower()))
+            if words & stem_words:
+                content = topic_file.read_text(encoding="utf-8").strip()
+                if content:
+                    loaded.append(f"### {topic_file.stem}\n{content}")
+                    logger.debug("Warm memory loaded: {}", topic_file.stem)
+
+        return "\n\n".join(loaded)
 
     def append_history(self, entry: str) -> None:
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
 
-    def get_memory_context(self) -> str:
-        long_term = self.read_long_term()
-        return f"## Long-term Memory\n{long_term}" if long_term else ""
+    def get_memory_context(self, user_message: str = "") -> str:
+        """Return memory for this turn: hot tier always + warm tier on keyword match."""
+        parts: list[str] = []
+
+        hot = self.read_long_term()
+        if hot:
+            parts.append(f"## Long-term Memory\n{hot}")
+
+        warm = self._load_warm_topics(user_message)
+        if warm:
+            parts.append(f"## Recalled Memory (topic match)\n\n{warm}")
+            logger.info("Warm memory injected for turn")
+
+        return "\n\n".join(parts)
 
     async def consolidate(
         self,

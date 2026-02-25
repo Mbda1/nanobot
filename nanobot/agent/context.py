@@ -27,28 +27,33 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
     
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        user_message: str = "",
+    ) -> str:
         """
         Build the system prompt from bootstrap files, memory, and skills.
-        
+
         Args:
             skill_names: Optional list of skills to include.
-        
+            user_message: Current user message — used for warm-tier keyword matching.
+
         Returns:
             Complete system prompt.
         """
         parts = []
-        
+
         # Core identity
         parts.append(self._get_identity())
-        
+
         # Bootstrap files
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
             parts.append(bootstrap)
-        
-        # Memory context
-        memory = self.memory.get_memory_context()
+
+        # Memory context (hot tier always + warm tier on keyword match)
+        memory = self.memory.get_memory_context(user_message)
         if memory:
             parts.append(f"# Memory\n\n{memory}")
         
@@ -80,14 +85,15 @@ Skills with available="false" need dependencies installed first - you can try in
         
         return f"""# nanobot 🐈
 
-You are nanobot, a helpful AI assistant. 
+You are nanobot, a helpful AI assistant.
 
 ## Runtime
 {runtime}
 
 ## Workspace
 Your workspace is at: {workspace_path}
-- Long-term memory: {workspace_path}/memory/MEMORY.md
+- Long-term memory: {workspace_path}/memory/MEMORY.md (hot tier, always loaded)
+- Topic memory: {workspace_path}/memory/topics/ (warm tier, auto-loaded when relevant)
 - History log: {workspace_path}/memory/HISTORY.md (grep-searchable)
 - Custom skills: {workspace_path}/skills/{{skill-name}}/SKILL.md
 
@@ -158,8 +164,9 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         """
         messages = []
 
-        # System prompt
-        system_prompt = self.build_system_prompt(skill_names)
+        # System prompt — pass current_message for warm-tier topic matching.
+        msg_text = current_message if isinstance(current_message, str) else ""
+        system_prompt = self.build_system_prompt(skill_names, user_message=msg_text)
         messages.append({"role": "system", "content": system_prompt})
 
         # History
