@@ -96,3 +96,6 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "llm: requires a running local Ollama instance — run with: pytest -m llm",
+]
