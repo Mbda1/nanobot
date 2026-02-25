@@ -43,15 +43,72 @@ class Session:
         self.updated_at = datetime.now()
     
     def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
-        """Get recent messages in LLM format, preserving tool metadata."""
+        """Get recent messages in LLM format, preserving tool metadata.
+
+        Repairs two classes of corruption that arise when the memory window
+        bisects a tool-call sequence or when a session was saved mid-turn:
+
+        Pass 1 — strip orphaned tool_results: a tool_result whose matching
+        tool_use (assistant message) was slid out of the window by the
+        max_messages cut.  The API rejects these with "unexpected tool_use_id".
+
+        Pass 2 — strip dangling tool_uses: an assistant message that still
+        carries tool_calls but whose corresponding tool_results were removed in
+        Pass 1 (or were never saved because the session was interrupted).
+        Leaving these in causes the API to expect a tool_result that never comes.
+        """
         out: list[dict[str, Any]] = []
         for m in self.messages[-max_messages:]:
-            entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}
+            entry: dict[str, Any] = {"role": m["role"], "content": m.get("content") or ""}
             for k in ("tool_calls", "tool_call_id", "name"):
                 if k in m:
                     entry[k] = m[k]
             out.append(entry)
-        return out
+
+        # Pass 1: collect all tool_use IDs present in this window.
+        tool_use_ids: set[str] = set()
+        for entry in out:
+            for call in entry.get("tool_calls", []):
+                tool_use_ids.add(call["id"])
+
+        # Pass 1 filter: drop tool_results with no matching tool_use in the window.
+        out = [
+            entry for entry in out
+            if not (entry.get("role") == "tool" and
+                    entry.get("tool_call_id") not in tool_use_ids)
+        ]
+
+        # Pass 2: collect which tool_call IDs actually have a result surviving Pass 1.
+        tool_result_ids: set[str] = {
+            e["tool_call_id"]
+            for e in out
+            if e.get("role") == "tool" and "tool_call_id" in e
+        }
+
+        # Pass 2 filter: for each assistant message with tool_calls, keep only
+        # the calls that have a surviving result.  If none survive and the
+        # message has no text content, drop the entry entirely.
+        final: list[dict[str, Any]] = []
+        for entry in out:
+            if entry.get("role") == "assistant" and entry.get("tool_calls"):
+                resolved = [tc for tc in entry["tool_calls"] if tc["id"] in tool_result_ids]
+                if len(resolved) == len(entry["tool_calls"]):
+                    # All calls have results — keep as-is.
+                    final.append(entry)
+                elif resolved:
+                    # Partial resolution — keep only the calls that have results.
+                    final.append({**entry, "tool_calls": resolved})
+                else:
+                    # No calls resolved.  Demote to a plain text message if there
+                    # is content; otherwise drop entirely to avoid a dangling
+                    # tool_use block that the API would require a response for.
+                    text_entry = {k: v for k, v in entry.items() if k != "tool_calls"}
+                    if text_entry.get("content"):
+                        final.append(text_entry)
+            else:
+                final.append(entry)
+
+        return final
     
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""

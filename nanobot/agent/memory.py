@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -41,6 +42,45 @@ _SAVE_MEMORY_TOOL = [
     }
 ]
 
+_CHUNK_SIZE = 8          # messages per chunk
+_CHUNK_MAX_TOKENS = 300  # output per chunk (plain text summary, no tool call)
+_MERGE_MAX_TOKENS = 2048 # output for final merge (full MEMORY.md via save_memory)
+
+
+async def _summarize_chunk(
+    provider: LLMProvider,
+    model: str,
+    chunk_text: str,
+) -> str:
+    """Summarize one chunk of messages as plain text. No tool call required."""
+    try:
+        response = await asyncio.wait_for(
+            provider.chat(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a memory summarizer. "
+                            "Summarize the key events, decisions, and facts from this "
+                            "conversation segment in 2-4 sentences. Be specific and include "
+                            "dates, names, and outcomes. Return ONLY the summary."
+                        ),
+                    },
+                    {"role": "user", "content": chunk_text},
+                ],
+                model=model,
+                max_tokens=_CHUNK_MAX_TOKENS,
+            ),
+            timeout=20.0,
+        )
+        return (response.content or "").strip()
+    except asyncio.TimeoutError:
+        logger.warning("Chunk summary timed out, using raw fallback")
+        return chunk_text[:300]  # graceful degradation — never skip
+    except Exception:
+        logger.exception("Chunk summary failed, using raw fallback")
+        return chunk_text[:300]
+
 
 class MemoryStore:
     """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
@@ -75,8 +115,9 @@ class MemoryStore:
         archive_all: bool = False,
         memory_window: int = 50,
     ) -> bool:
-        """Consolidate old messages into MEMORY.md + HISTORY.md via LLM tool call.
+        """Consolidate old messages into MEMORY.md + HISTORY.md via chunked pipeline.
 
+        Pipeline: CHUNK (Python) → COLLECT (Mistral×N) → ASSEMBLE (Python) → MERGE (Mistral×1)
         Returns True on success (including no-op), False on failure.
         """
         if archive_all:
@@ -94,6 +135,7 @@ class MemoryStore:
                 return True
             logger.info("Memory consolidation: {} to consolidate, {} keep", len(old_messages), keep_count)
 
+        # --- Build message lines (same as before) ---
         lines = []
         for m in old_messages:
             if not m.get("content"):
@@ -101,27 +143,54 @@ class MemoryStore:
             tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
             lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
 
+        # --- PHASE 1: CHUNK (Python, zero tokens) ---
+        chunks = [lines[i:i + _CHUNK_SIZE] for i in range(0, len(lines), _CHUNK_SIZE)]
+        logger.info("Consolidation: {} messages → {} chunks", len(lines), len(chunks))
+
+        # --- PHASE 2: COLLECT — summarize each chunk locally ---
+        partial_summaries: list[str] = []
+        for idx, chunk in enumerate(chunks):
+            chunk_text = "\n".join(chunk)
+            summary = await _summarize_chunk(provider, model, chunk_text)
+            partial_summaries.append(f"[Segment {idx + 1}/{len(chunks)}] {summary}")
+
+        # --- PHASE 3: ASSEMBLE (Python, zero tokens) ---
+        assembled = "\n\n".join(partial_summaries)
+
+        # --- PHASE 4: MERGE — one final call with save_memory tool ---
         current_memory = self.read_long_term()
-        prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
+        merge_prompt = f"""Update the long-term memory based on these conversation summaries.
 
 ## Current Long-term Memory
 {current_memory or "(empty)"}
 
-## Conversation to Process
-{chr(10).join(lines)}"""
+## Conversation Summaries (assembled from {len(chunks)} segments)
+{assembled}
 
-        try:
-            response = await provider.chat(
-                messages=[
-                    {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
-                    {"role": "user", "content": prompt},
-                ],
-                tools=_SAVE_MEMORY_TOOL,
-                model=model,
-            )
+Call save_memory with:
+- history_entry: a 2-5 sentence log entry starting with [YYYY-MM-DD HH:MM]
+- memory_update: the full updated MEMORY.md incorporating all new facts"""
+
+        for attempt in range(2):
+            try:
+                response = await provider.chat(
+                    messages=[
+                        {"role": "system", "content": "You are a memory consolidation agent. You MUST call the save_memory tool — do not reply with text."},
+                        {"role": "user", "content": merge_prompt},
+                    ],
+                    tools=_SAVE_MEMORY_TOOL,
+                    model=model,
+                    max_tokens=_MERGE_MAX_TOKENS,
+                )
+            except Exception:
+                logger.exception("Memory consolidation failed")
+                return False
 
             if not response.has_tool_calls:
-                logger.warning("Memory consolidation: LLM did not call save_memory, skipping")
+                if attempt == 0:
+                    logger.warning("Memory consolidation: LLM did not call save_memory, retrying")
+                    continue
+                logger.warning("Memory consolidation: LLM did not call save_memory after retry, skipping")
                 return False
 
             args = response.tool_calls[0].arguments
@@ -138,6 +207,4 @@ class MemoryStore:
             session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
             logger.info("Memory consolidation done: {} messages, last_consolidated={}", len(session.messages), session.last_consolidated)
             return True
-        except Exception:
-            logger.exception("Memory consolidation failed")
-            return False
+        return False

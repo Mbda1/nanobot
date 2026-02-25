@@ -327,12 +327,14 @@ async def run_supervisor(config, verbose: bool = False) -> None:
                         continue
                     result = await apply_fix(issue, config, workspace)
                     await write_audit(issue, result, workspace)
-                    # Notify on auto-fixes AND suggestions so nothing is silent
-                    if issue.get("severity") in ("critical", "warning") or fix_type == "suggest":
+                    # Notify Telegram only for critical issues or auto-applied fixes.
+                    # Suggestions and warnings from normal operations (heartbeat,
+                    # memory consolidation, write_file, etc.) are logged locally only.
+                    if issue.get("severity") == "critical" or fix_type not in ("suggest", "none"):
                         await notify_telegram(issue, result, config)
-                        logger.info(
-                            f"[supervisor] {issue.get('severity', 'info').upper()} — "
-                            f"{issue.get('description')} — {result}"
-                        )
+                    logger.info(
+                        f"[supervisor] {issue.get('severity', 'info').upper()} — "
+                        f"{issue.get('description')} — {result}"
+                    )
             buffer = []
             last_flush = time.monotonic()

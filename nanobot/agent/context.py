@@ -74,7 +74,7 @@ Skills with available="false" need dependencies installed first - you can try in
         """Get the core identity section."""
         from datetime import datetime
         import time as _time
-        now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+        now = datetime.now().strftime("%Y-%m-%d (%A)")
         tz = _time.strftime("%Z") or "UTC"
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
