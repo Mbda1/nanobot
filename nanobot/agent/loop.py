@@ -14,6 +14,7 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.enrichment import enrich_query
 from nanobot.agent.memory import MemoryStore
+from nanobot.agent.usage import init as _usage_init, record as _usage_record
 from nanobot.config.constants import TOOL_RESULT_MAX_CHARS
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
@@ -80,6 +81,7 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
 
+        _usage_init(workspace)
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
@@ -196,6 +198,7 @@ class AgentLoop:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
+            _usage_record(self.model, response.usage, source="agent")
 
             if response.finish_reason == "error":
                 raise RuntimeError(response.content)

@@ -6,6 +6,7 @@ import asyncio
 
 from loguru import logger
 
+from nanobot.agent.usage import record as _usage_record
 from nanobot.config.constants import LOCAL_API_BASE, TIMEOUT_ENRICHMENT
 
 
@@ -45,6 +46,12 @@ async def enrich_query(provider, model: str, message: str) -> str:
             ),
             timeout=TIMEOUT_ENRICHMENT,
         )
+        if hasattr(resp, "usage") and resp.usage:
+            _usage_record(model, {
+                "prompt_tokens": resp.usage.prompt_tokens,
+                "completion_tokens": resp.usage.completion_tokens,
+                "total_tokens": resp.usage.total_tokens,
+            }, source="enrichment")
         enriched = resp.choices[0].message.content.strip()
         if enriched:
             logger.info("Query enriched: {} → {}", stripped[:60], enriched[:60])

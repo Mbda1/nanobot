@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from nanobot.agent.usage import record as _usage_record
 from nanobot.config.constants import (
     MEMORY_CHUNK_SIZE,
     MEMORY_CHUNK_MAX_TOKENS,
@@ -79,6 +80,7 @@ async def _summarize_chunk(
             ),
             timeout=TIMEOUT_CHUNK_SUMMARY,
         )
+        _usage_record(model, getattr(response, "usage", {}), source="memory_chunk")
         return (response.content or "").strip()
     except asyncio.TimeoutError:
         logger.warning("Chunk summary timed out, using raw fallback")
@@ -192,6 +194,7 @@ Call save_memory with:
                 logger.exception("Memory consolidation failed")
                 return False
 
+            _usage_record(model, response.usage, source="memory_merge")
             if not response.has_tool_calls:
                 if attempt == 0:
                     logger.warning("Memory consolidation: LLM did not call save_memory, retrying")
