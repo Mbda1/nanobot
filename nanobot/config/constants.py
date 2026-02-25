@@ -37,6 +37,13 @@ OLLAMA_KEEP_ALIVE     = -1
 # --- Limits ---
 TOOL_RESULT_MAX_CHARS = 500    # tool output truncation    (loop.py)
 
+# --- Circuit breakers (loop.py) ---
+# Trip when the same tool is called more than this many times in one turn.
+CIRCUIT_BREAKER_PER_TOOL   = 5
+# Trip immediately when the same tool + same primary argument is repeated
+# this many times consecutively (classic stuck-loop signature).
+CIRCUIT_BREAKER_CONSECUTIVE = 2
+
 # --- Context builder ---
 BOOTSTRAP_FILES  = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
 TIMESTAMP_FORMAT = "%Y-%m-%d (%A)"   # date-only → system prompt stable 24h (cache hits)

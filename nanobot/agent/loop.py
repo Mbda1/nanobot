@@ -15,7 +15,11 @@ from nanobot.agent.context import ContextBuilder
 from nanobot.agent.enrichment import enrich_query
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.usage import init as _usage_init, record as _usage_record
-from nanobot.config.constants import TOOL_RESULT_MAX_CHARS
+from nanobot.config.constants import (
+    CIRCUIT_BREAKER_CONSECUTIVE,
+    CIRCUIT_BREAKER_PER_TOOL,
+    TOOL_RESULT_MAX_CHARS,
+)
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
@@ -190,6 +194,11 @@ class AgentLoop:
         final_content = None
         tools_used: list[str] = []
 
+        # Circuit breaker state (reset each turn)
+        _tool_counts: dict[str, int] = {}
+        _last_sig: str | None = None   # "tool_name:primary_arg" of last call
+        _consecutive: int = 0          # consecutive identical-sig calls
+
         while iteration < self.max_iterations:
             iteration += 1
 
@@ -229,12 +238,45 @@ class AgentLoop:
                 )
 
                 for tool_call in response.tool_calls:
-                    tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    name = tool_call.name
+                    _tool_counts[name] = _tool_counts.get(name, 0) + 1
+
+                    # Build a signature from tool name + primary argument for consecutive detection.
+                    primary = next(iter(tool_call.arguments.values()), "") if tool_call.arguments else ""
+                    sig = f"{name}:{str(primary)[:60]}"
+                    if sig == _last_sig:
+                        _consecutive += 1
+                    else:
+                        _consecutive = 1
+                        _last_sig = sig
+
+                    # --- Circuit breaker ---
+                    breaker_reason: str | None = None
+                    if _consecutive > CIRCUIT_BREAKER_CONSECUTIVE:
+                        breaker_reason = (
+                            f"identical call repeated {_consecutive}× in a row — "
+                            "this is a loop"
+                        )
+                    elif _tool_counts[name] > CIRCUIT_BREAKER_PER_TOOL:
+                        breaker_reason = (
+                            f"called {_tool_counts[name]}× this turn "
+                            f"(limit: {CIRCUIT_BREAKER_PER_TOOL})"
+                        )
+
+                    if breaker_reason:
+                        logger.warning("Circuit breaker tripped: {} — {}", name, breaker_reason)
+                        result = (
+                            f"Error: Circuit breaker tripped for '{name}' — {breaker_reason}. "
+                            "Stop calling this tool and give a final answer with what you have."
+                        )
+                    else:
+                        tools_used.append(name)
+                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                        logger.info("Tool call: {}({})", name, args_str[:200])
+                        result = await self.tools.execute(name, tool_call.arguments)
+
                     messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
+                        messages, tool_call.id, name, result
                     )
             else:
                 final_content = self._strip_think(response.content)
