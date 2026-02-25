@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 import httpx
 
 from nanobot.agent.tools.base import Tool
+from nanobot.config.constants import TIMEOUT_WEB_FETCH
 
 # Shared constants
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
@@ -109,7 +110,7 @@ class WebFetchTool(Tool):
             async with httpx.AsyncClient(
                 follow_redirects=True,
                 max_redirects=MAX_REDIRECTS,
-                timeout=30.0
+                timeout=TIMEOUT_WEB_FETCH,
             ) as client:
                 r = await client.get(url, headers={"User-Agent": USER_AGENT})
                 r.raise_for_status()

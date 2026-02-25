@@ -14,6 +14,8 @@ from typing import AsyncIterator
 
 from loguru import logger
 
+from nanobot.config.constants import LOCAL_MODEL_DEFAULT, LOCAL_API_BASE
+
 
 # ---------------------------------------------------------------------------
 # Log Watcher — async tail of nanobot.log
@@ -79,8 +81,8 @@ async def detect_issues(lines: list[str]) -> list[dict]:
 
     try:
         response = await litellm.acompletion(
-            model="ollama/mistral",
-            api_base="http://host.docker.internal:11434",
+            model=LOCAL_MODEL_DEFAULT,
+            api_base=LOCAL_API_BASE,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": batch_text},

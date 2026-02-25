@@ -12,7 +12,9 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.agent.enrichment import enrich_query
 from nanobot.agent.memory import MemoryStore
+from nanobot.config.constants import TOOL_RESULT_MAX_CHARS
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
@@ -390,7 +392,7 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=self.memory_window)
-        enriched_content = await self._enrich_query(msg.content)
+        enriched_content = await enrich_query(self.provider, self.local_model, msg.content)
         initial_messages = self.context.build_messages(
             history=history,
             current_message=enriched_content,
@@ -428,7 +430,7 @@ class AgentLoop:
             metadata=msg.metadata or {},
         )
 
-    _TOOL_RESULT_MAX_CHARS = 500
+    _TOOL_RESULT_MAX_CHARS = TOOL_RESULT_MAX_CHARS
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save new-turn messages into session, truncating large tool results."""
@@ -450,52 +452,6 @@ class AgentLoop:
             session, self.provider, model,
             archive_all=archive_all, memory_window=self.memory_window,
         )
-
-    async def _enrich_query(self, content: str) -> str:
-        """Use local model to improve the user's query before sending to cloud.
-
-        Only triggers for substantial messages (>= 6 words). Falls back to
-        the original on timeout or error. Cap at 10 s to avoid blocking.
-        """
-        if not self.local_model:
-            return content
-
-        # Skip commands and trivial messages
-        stripped = content.strip()
-        if stripped.startswith("/") or len(stripped.split()) < 6:
-            return content
-
-        system = (
-            "You are a query-refinement assistant. "
-            "Rewrite the user's message to be clearer and more specific "
-            "so an AI assistant can give a better answer. "
-            "Preserve the original intent exactly. "
-            "Return ONLY the rewritten message — no explanation, no preamble."
-        )
-        try:
-            import litellm
-            resp = await asyncio.wait_for(
-                litellm.acompletion(
-                    model=self.local_model,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": stripped},
-                    ],
-                    api_base="http://host.docker.internal:11434",
-                    max_tokens=300,
-                    temperature=0.2,
-                ),
-                timeout=10.0,
-            )
-            enriched = resp.choices[0].message.content.strip()
-            if enriched:
-                logger.info("Query enriched: {} → {}", stripped[:60], enriched[:60])
-                return enriched
-        except asyncio.TimeoutError:
-            logger.debug("Query enrichment timed out, using original")
-        except Exception as exc:
-            logger.debug("Query enrichment failed: {}", exc)
-        return content
 
     async def process_direct(
         self,

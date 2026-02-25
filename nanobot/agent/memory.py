@@ -9,6 +9,12 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from nanobot.config.constants import (
+    MEMORY_CHUNK_SIZE,
+    MEMORY_CHUNK_MAX_TOKENS,
+    MEMORY_MERGE_MAX_TOKENS,
+    TIMEOUT_CHUNK_SUMMARY,
+)
 from nanobot.utils.helpers import ensure_dir
 
 if TYPE_CHECKING:
@@ -42,9 +48,9 @@ _SAVE_MEMORY_TOOL = [
     }
 ]
 
-_CHUNK_SIZE = 8          # messages per chunk
-_CHUNK_MAX_TOKENS = 300  # output per chunk (plain text summary, no tool call)
-_MERGE_MAX_TOKENS = 2048 # output for final merge (full MEMORY.md via save_memory)
+_CHUNK_SIZE = MEMORY_CHUNK_SIZE
+_CHUNK_MAX_TOKENS = MEMORY_CHUNK_MAX_TOKENS
+_MERGE_MAX_TOKENS = MEMORY_MERGE_MAX_TOKENS
 
 
 async def _summarize_chunk(
@@ -71,7 +77,7 @@ async def _summarize_chunk(
                 model=model,
                 max_tokens=_CHUNK_MAX_TOKENS,
             ),
-            timeout=20.0,
+            timeout=TIMEOUT_CHUNK_SUMMARY,
         )
         return (response.content or "").strip()
     except asyncio.TimeoutError:

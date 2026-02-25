@@ -8,6 +8,7 @@ from typing import Any
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
+from nanobot.config.constants import BOOTSTRAP_FILES as _BOOTSTRAP_FILES, TIMESTAMP_FORMAT
 
 
 class ContextBuilder:
@@ -18,7 +19,7 @@ class ContextBuilder:
     into a coherent prompt for the LLM.
     """
     
-    BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
+    BOOTSTRAP_FILES = _BOOTSTRAP_FILES
     
     def __init__(self, workspace: Path):
         self.workspace = workspace
@@ -74,7 +75,7 @@ Skills with available="false" need dependencies installed first - you can try in
         """Get the core identity section."""
         from datetime import datetime
         import time as _time
-        now = datetime.now().strftime("%Y-%m-%d (%A)")
+        now = datetime.now().strftime(TIMESTAMP_FORMAT)
         tz = _time.strftime("%Z") or "UTC"
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
