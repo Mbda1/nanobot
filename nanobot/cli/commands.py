@@ -1150,6 +1150,27 @@ def supervisor(
     asyncio.run(run_supervisor(config, verbose=verbose))
 
 
+@app.command(name="dashboard")
+def run_dashboard(
+    port: int = typer.Option(8765, "--port", "-p", help="Port to listen on"),
+):
+    """Start the live dashboard server at http://localhost:PORT (zero tokens)."""
+    dashboard_script = Path.home() / ".nanobot/workspace/agents/dashboard-server.py"
+    if not dashboard_script.exists():
+        console.print(f"[red]Dashboard script not found: {dashboard_script}[/red]")
+        console.print("[dim]Run generate-dashboard.py first, or check the workspace/agents/ directory.[/dim]")
+        raise typer.Exit(1)
+
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("dashboard_server", dashboard_script)
+    mod = importlib.util.module_from_spec(spec)   # type: ignore[arg-type]
+    spec.loader.exec_module(mod)                   # type: ignore[union-attr]
+    mod.PORT = port
+    console.print(f"[green]nanobot dashboard[/green]  →  http://localhost:{port}")
+    console.print("[dim]Ctrl+C to stop.[/dim]")
+    mod.main()
+
+
 # ============================================================================
 # Process Control — stop / start / restart agents
 # ============================================================================
@@ -1157,6 +1178,7 @@ def supervisor(
 _AGENT_PATTERNS = {
     "gateway":    "nanobot gateway",
     "supervisor": "nanobot supervisor",
+    "dashboard":  "nanobot dashboard",
 }
 
 
