@@ -164,7 +164,29 @@ async def _restart_gateway() -> str:
     except FileNotFoundError:
         pass  # pgrep not available
 
-    await asyncio.sleep(2)  # give old process time to exit
+    # Wait for old processes to actually exit (Telegram shutdown takes >2s)
+    if pids:
+        deadline = 10  # seconds
+        for _ in range(deadline * 5):
+            await asyncio.sleep(0.2)
+            check = subprocess.run(
+                ["pgrep", "-f", "nanobot gateway"],
+                capture_output=True, text=True,
+            )
+            still_alive = [p for p in check.stdout.splitlines()
+                           if p.strip() and p.strip() in pids]
+            if not still_alive:
+                break
+        else:
+            # Hard kill anything still running after deadline
+            for pid in pids:
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except (ProcessLookupError, ValueError):
+                    pass
+            await asyncio.sleep(0.5)
+    else:
+        await asyncio.sleep(1)
 
     # Spawn a new gateway (detached)
     try:

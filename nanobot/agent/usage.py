@@ -16,7 +16,7 @@ def init(workspace: Path) -> None:
     _log_path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def record(model: str, usage: dict, source: str = "agent") -> None:
+def record(model: str, usage: dict, source: str = "agent", latency_ms: int = 0) -> None:
     """Append one usage record. No-ops silently if usage is empty or logger not init'd."""
     if not _log_path or not usage or not usage.get("total_tokens"):
         return
@@ -27,6 +27,7 @@ def record(model: str, usage: dict, source: str = "agent") -> None:
         "prompt": usage.get("prompt_tokens", 0),
         "completion": usage.get("completion_tokens", 0),
         "total": usage.get("total_tokens", 0),
+        "latency_ms": latency_ms,
     }
     with open(_log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")

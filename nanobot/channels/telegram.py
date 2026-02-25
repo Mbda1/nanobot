@@ -440,7 +440,11 @@ class TelegramChannel(BaseChannel):
         
         # Store chat_id for replies
         self._chat_ids[sender_id] = chat_id
-        
+        str_chat_id = str(chat_id)
+
+        # Acknowledge receipt immediately — user sees typing before any processing
+        self._start_typing(str_chat_id)
+
         # Build content from text and/or media
         content_parts = []
         media_paths = []
@@ -506,8 +510,6 @@ class TelegramChannel(BaseChannel):
 
         logger.debug("Telegram message from {}: {}...", sender_id, content[:50])
 
-        str_chat_id = str(chat_id)
-
         # --- Twitter/X.com state machine (deterministic, no LLM involved) ---
         twitter_match = self._extract_twitter_url(content)
 
@@ -518,12 +520,14 @@ class TelegramChannel(BaseChannel):
             if title_text:
                 # URL + title in same message → save directly, no LLM
                 logger.info("Tweet with inline title from {}: '{}'", sender_id, title_text)
+                self._stop_typing(str_chat_id)
                 await self._save_tweet_bookmark(chat_id, url, handle, title_text)
                 return
             else:
                 # URL only → store pending, ask for title directly, no LLM
                 self._set_pending_tweet(sender_id, url, handle)
                 logger.info("Tweet URL stored as pending for {}: {}", sender_id, handle)
+                self._stop_typing(str_chat_id)
                 try:
                     await self._app.bot.send_message(
                         chat_id=chat_id,
@@ -539,13 +543,11 @@ class TelegramChannel(BaseChannel):
             handle = pending["handle"]
             title = content.strip()
             logger.info("Tweet title received for pending {}: '{}'", handle, title)
+            self._stop_typing(str_chat_id)
             await self._save_tweet_bookmark(chat_id, url, handle, title)
             return
 
         # --- End Twitter state machine ---
-
-        # Start typing indicator before processing
-        self._start_typing(str_chat_id)
 
         # Forward to the message bus
         await self._handle_message(

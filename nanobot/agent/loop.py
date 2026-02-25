@@ -211,7 +211,7 @@ class AgentLoop:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
-            _usage_record(self.model, response.usage, source="agent")
+            _usage_record(self.model, response.usage, source="agent", latency_ms=response.latency_ms)
 
             if response.finish_reason == "error":
                 raise RuntimeError(response.content)

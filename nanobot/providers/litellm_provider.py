@@ -3,6 +3,7 @@
 import json
 import json_repair
 import os
+import time
 from typing import Any
 
 import litellm
@@ -222,8 +223,12 @@ class LiteLLMProvider(LLMProvider):
             kwargs["tool_choice"] = "auto"
         
         try:
+            _t0 = time.monotonic()
             response = await acompletion(**kwargs)
-            return self._parse_response(response)
+            _latency_ms = int((time.monotonic() - _t0) * 1000)
+            result = self._parse_response(response)
+            result.latency_ms = _latency_ms
+            return result
         except Exception as e:
             # Return error as content for graceful handling
             return LLMResponse(
