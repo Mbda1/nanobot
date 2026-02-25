@@ -251,6 +251,8 @@ class AgentLoop:
         """Run the agent loop, processing messages from the bus."""
         self._running = True
         await self._connect_mcp()
+        if self.local_model:
+            asyncio.create_task(self._warmup_local_model())
         logger.info("Agent loop started")
 
         while self._running:
@@ -455,6 +457,36 @@ class AgentLoop:
             session, self.provider, model,
             archive_all=archive_all, memory_window=self.memory_window,
         )
+
+    async def _warmup_local_model(self) -> None:
+        """Load the local model into Ollama RAM with keep_alive=-1 (never unload).
+
+        LiteLLM silently drops the keep_alive param, so we call the Ollama
+        /api/chat endpoint directly. keep_alive=-1 pins the model in RAM until
+        Ollama itself is restarted — eliminates cold-start timeouts entirely.
+        """
+        if not self.local_model:
+            return
+        # Extract bare model name (e.g. "ollama/mistral" → "mistral")
+        model_name = self.local_model.split("/")[-1]
+        from nanobot.config.constants import LOCAL_API_BASE
+        ollama_base = LOCAL_API_BASE.rstrip("/")
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                await client.post(
+                    f"{ollama_base}/api/chat",
+                    json={
+                        "model": model_name,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": False,
+                        "keep_alive": -1,
+                        "options": {"num_predict": 1},
+                    },
+                )
+            logger.info("Local model pinned in RAM: {} (keep_alive=-1)", model_name)
+        except Exception as exc:
+            logger.debug("Local model warmup skipped (Ollama may be offline): {}", exc)
 
     async def process_direct(
         self,

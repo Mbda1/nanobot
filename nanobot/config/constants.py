@@ -29,6 +29,11 @@ TIMEOUT_ENRICHMENT    = 10.0   # query enrichment          (loop.py)
 TIMEOUT_CHUNK_SUMMARY = 20.0   # chunk summarization       (memory.py)
 TIMEOUT_WEB_FETCH     = 30.0   # HTTP fetch                (tools/web.py)
 
+# --- Ollama keep-alive ---
+# -1 = keep model loaded in RAM indefinitely (never unload on idle)
+# Ollama default is 5 minutes, which causes cold-start timeouts
+OLLAMA_KEEP_ALIVE     = -1
+
 # --- Limits ---
 TOOL_RESULT_MAX_CHARS = 500    # tool output truncation    (loop.py)
 
