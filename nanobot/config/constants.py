@@ -43,6 +43,9 @@ TOOL_RESULT_MAX_CHARS = 500    # tool output truncation    (loop.py)
 # Warm-tier files are keyword-matched against the user's message and loaded on demand.
 MEMORY_HOT_MAX_LINES = 200
 
+# --- Supervisor / delegation ---
+DELEGATE_MAX_ITERATIONS = 15   # max LLM iterations per delegated worker
+
 # --- Circuit breakers (loop.py) ---
 # Trip when the same tool is called more than this many times in one turn.
 CIRCUIT_BREAKER_PER_TOOL   = 5

@@ -28,6 +28,7 @@ from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.browser import WebBrowseTool
+from nanobot.agent.tools.delegate import DelegateTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -127,6 +128,7 @@ class AgentLoop:
         self.tools.register(WebBrowseTool())
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
+        self.tools.register(DelegateTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
 
@@ -237,11 +239,14 @@ class AgentLoop:
                     reasoning_content=response.reasoning_content,
                 )
 
+                # --- Phase 1: sequential — apply circuit breakers, decide what to run ---
+                # Results list: (tool_call, pre_computed_result | None)
+                # None means "needs actual execution" (not blocked).
+                _call_plan: list[tuple[Any, str | None]] = []
                 for tool_call in response.tool_calls:
                     name = tool_call.name
                     _tool_counts[name] = _tool_counts.get(name, 0) + 1
 
-                    # Build a signature from tool name + primary argument for consecutive detection.
                     primary = next(iter(tool_call.arguments.values()), "") if tool_call.arguments else ""
                     sig = f"{name}:{str(primary)[:60]}"
                     if sig == _last_sig:
@@ -250,7 +255,6 @@ class AgentLoop:
                         _consecutive = 1
                         _last_sig = sig
 
-                    # --- Circuit breaker ---
                     breaker_reason: str | None = None
                     if _consecutive > CIRCUIT_BREAKER_CONSECUTIVE:
                         breaker_reason = (
@@ -265,18 +269,31 @@ class AgentLoop:
 
                     if breaker_reason:
                         logger.warning("Circuit breaker tripped: {} — {}", name, breaker_reason)
-                        result = (
+                        blocked = (
                             f"Error: Circuit breaker tripped for '{name}' — {breaker_reason}. "
                             "Stop calling this tool and give a final answer with what you have."
                         )
+                        _call_plan.append((tool_call, blocked))
                     else:
                         tools_used.append(name)
-                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                        logger.info("Tool call: {}({})", name, args_str[:200])
-                        result = await self.tools.execute(name, tool_call.arguments)
+                        logger.info("Tool call: {}({})", name,
+                                    json.dumps(tool_call.arguments, ensure_ascii=False)[:200])
+                        _call_plan.append((tool_call, None))
 
+                # --- Phase 2: parallel — execute non-blocked calls concurrently ---
+                _pending_idx = [i for i, (_, r) in enumerate(_call_plan) if r is None]
+                if _pending_idx:
+                    _results = await asyncio.gather(*[
+                        self.tools.execute(_call_plan[i][0].name, _call_plan[i][0].arguments)
+                        for i in _pending_idx
+                    ])
+                    for idx, res in zip(_pending_idx, _results):
+                        _call_plan[idx] = (_call_plan[idx][0], res)
+
+                # --- Phase 3: add all results to messages in original order ---
+                for tool_call, result in _call_plan:
                     messages = self.context.add_tool_result(
-                        messages, tool_call.id, name, result
+                        messages, tool_call.id, tool_call.name, result
                     )
             else:
                 final_content = self._strip_think(response.content)
