@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 from nanobot.agent.local_llm import ollama_chat
+from nanobot.config.constants import JUDGE_MODEL_DEFAULT
 
 _JUDGE_PROMPT = """\
 You are a strict AI response evaluator. Read the user question and the AI response below, \
@@ -30,7 +31,7 @@ Criterion: {criterion}
 Reply with exactly one word on the first line — PASS or FAIL — then one brief sentence explaining why.\
 """
 
-_DEFAULT_MODEL = "mistral"
+_DEFAULT_MODEL = JUDGE_MODEL_DEFAULT  # "ollama/mistral-nemo" from constants
 _DEFAULT_TIMEOUT = 30.0
 
 
@@ -54,8 +55,10 @@ async def judge_response(
         criterion=criterion.strip(),
     )
 
+    # ollama_chat takes the bare model name (strip "ollama/" prefix if present)
+    model_name = model.split("/")[-1]
     content, _ = await ollama_chat(
-        model,
+        model_name,
         [{"role": "user", "content": prompt}],
         max_tokens=100,
         temperature=0.0,

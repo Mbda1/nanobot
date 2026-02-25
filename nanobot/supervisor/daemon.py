@@ -14,7 +14,7 @@ from typing import AsyncIterator
 
 from loguru import logger
 
-from nanobot.config.constants import LOCAL_MODEL_DEFAULT, LOCAL_API_BASE
+from nanobot.config.constants import JUDGE_MODEL_DEFAULT, LOCAL_API_BASE
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +81,7 @@ async def detect_issues(lines: list[str]) -> list[dict]:
 
     try:
         response = await litellm.acompletion(
-            model=LOCAL_MODEL_DEFAULT,
+            model=JUDGE_MODEL_DEFAULT,
             api_base=LOCAL_API_BASE,
             messages=[
                 {"role": "system", "content": system_prompt},

@@ -2,7 +2,8 @@
 
 Quick reference:
   Change cloud model   → CLOUD_MODEL_DEFAULT
-  Change local model   → LOCAL_MODEL_DEFAULT / LOCAL_API_BASE
+  Change local model   → LOCAL_MODEL_DEFAULT (enrichment/memory) / JUDGE_MODEL_DEFAULT (eval/supervisor)
+  Change API base      → LOCAL_API_BASE
   Change token budget  → MAX_TOKENS_DEFAULT / MEMORY_MERGE_MAX_TOKENS
   Change memory tuning → MEMORY_CHUNK_SIZE / MEMORY_WINDOW_DEFAULT
   Change timeouts      → TIMEOUT_* values
@@ -10,7 +11,8 @@ Quick reference:
 
 # --- Models ---
 CLOUD_MODEL_DEFAULT = "openrouter/anthropic/claude-haiku-4-5"
-LOCAL_MODEL_DEFAULT = "ollama/mistral"
+LOCAL_MODEL_DEFAULT = "ollama/qwen2.5:7b"    # enrichment + memory (fast, ~27 tok/s)
+JUDGE_MODEL_DEFAULT = "ollama/mistral-nemo"  # eval judge + supervisor (quality, ~16 tok/s)
 LOCAL_API_BASE      = "http://host.docker.internal:11434"
 
 # --- Agent limits ---
