@@ -16,7 +16,7 @@ Usage:
 from __future__ import annotations
 
 from nanobot.agent.local_llm import ollama_chat
-from nanobot.config.constants import JUDGE_MODEL_DEFAULT
+from nanobot.config.constants import JUDGE_MODEL_DEFAULT, TIMEOUT_JUDGE
 
 _JUDGE_PROMPT = """\
 You are a strict AI response evaluator. Read the user question and the AI response below, \
@@ -32,7 +32,7 @@ Reply with exactly one word on the first line — PASS or FAIL — then one brie
 """
 
 _DEFAULT_MODEL = JUDGE_MODEL_DEFAULT  # "ollama/mistral-nemo" from constants
-_DEFAULT_TIMEOUT = 30.0
+_DEFAULT_TIMEOUT = TIMEOUT_JUDGE      # 60s — Nemo 12B needs headroom on cold start
 
 
 async def judge_response(

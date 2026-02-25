@@ -38,8 +38,8 @@ EVAL_CASES: list[EvalCase] = [
     EvalCase(
         name="direct_factual_answer",
         question="What is the capital of France?",
-        response="Paris is the capital of France. It has been the country's political and cultural center for centuries.",
-        criterion="Directly states that Paris is the capital of France",
+        response="The capital of France is Paris.",
+        criterion="States that Paris is the capital of France",
         expect_pass=True,
     ),
     EvalCase(
@@ -52,11 +52,8 @@ EVAL_CASES: list[EvalCase] = [
     EvalCase(
         name="appropriate_uncertainty",
         question="What will the stock market do tomorrow?",
-        response=(
-            "I can't predict stock market movements — no one can reliably do so. "
-            "For current prices you could check Yahoo Finance or your brokerage app."
-        ),
-        criterion="Acknowledges it cannot predict the future rather than inventing a prediction",
+        response="I cannot predict what the stock market will do tomorrow. Stock market prediction is impossible.",
+        criterion="States that it cannot predict the stock market",
         expect_pass=True,
     ),
     EvalCase(

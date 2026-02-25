@@ -30,6 +30,7 @@ MEMORY_MERGE_MAX_TOKENS = 2048  # final save_memory call
 TIMEOUT_ENRICHMENT    = 10.0   # query enrichment          (enrichment.py)
 TIMEOUT_CHUNK_SUMMARY = 20.0   # chunk summarization       (memory.py) — cloud, fast
 TIMEOUT_WEB_FETCH     = 30.0   # HTTP fetch                (tools/web.py)
+TIMEOUT_JUDGE         = 60.0   # LLM-as-judge eval         (eval.py) — Nemo 12B needs headroom on cold start
 
 # --- Ollama keep-alive ---
 # -1 = keep model loaded in RAM indefinitely (never unload on idle)
