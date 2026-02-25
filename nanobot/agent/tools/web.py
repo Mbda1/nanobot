@@ -59,7 +59,13 @@ class WebSearchTool(Tool):
     }
 
     def __init__(self, api_key: str | None = None, max_results: int = 5):
+        self._init_api_key = api_key
         self.max_results = max_results
+
+    @property
+    def api_key(self) -> str:
+        """Resolve API key at call time so env/config changes are picked up."""
+        return self._init_api_key or os.environ.get("BRAVE_API_KEY", "")
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
         try:
@@ -80,7 +86,7 @@ class WebSearchTool(Tool):
 
 class WebFetchTool(Tool):
     """Fetch and extract content from a URL using Readability."""
-    
+
     name = "web_fetch"
     description = "Fetch URL and extract readable content (HTML → markdown/text)."
     parameters = {
@@ -92,10 +98,10 @@ class WebFetchTool(Tool):
         },
         "required": ["url"]
     }
-    
+
     def __init__(self, max_chars: int = 50000):
         self.max_chars = max_chars
-    
+
     async def execute(self, url: str, extractMode: str = "markdown", maxChars: int | None = None, **kwargs: Any) -> str:
         from readability import Document
 
@@ -114,9 +120,9 @@ class WebFetchTool(Tool):
             ) as client:
                 r = await client.get(url, headers={"User-Agent": USER_AGENT})
                 r.raise_for_status()
-            
+
             ctype = r.headers.get("content-type", "")
-            
+
             # JSON
             if "application/json" in ctype:
                 text, extractor = json.dumps(r.json(), indent=2, ensure_ascii=False), "json"
@@ -128,16 +134,16 @@ class WebFetchTool(Tool):
                 extractor = "readability"
             else:
                 text, extractor = r.text, "raw"
-            
+
             truncated = len(text) > max_chars
             if truncated:
                 text = text[:max_chars]
-            
+
             return json.dumps({"url": url, "finalUrl": str(r.url), "status": r.status_code,
                               "extractor": extractor, "truncated": truncated, "length": len(text), "text": text}, ensure_ascii=False)
         except Exception as e:
             return json.dumps({"error": str(e), "url": url}, ensure_ascii=False)
-    
+
     def _to_markdown(self, html: str) -> str:
         """Convert HTML to markdown."""
         # Convert links, headings, lists before stripping tags
