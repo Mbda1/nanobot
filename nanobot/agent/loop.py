@@ -252,7 +252,7 @@ class AgentLoop:
         self._running = True
         await self._connect_mcp()
         if self.local_model:
-            asyncio.create_task(self._warmup_local_model())
+            await self._warmup_local_model()  # await: ensure model is in RAM before first message
         logger.info("Agent loop started")
 
         while self._running:
@@ -452,9 +452,8 @@ class AgentLoop:
 
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
-        model = self.local_model or self.model
         return await MemoryStore(self.workspace).consolidate(
-            session, self.provider, model,
+            session, self.provider, self.model,
             archive_all=archive_all, memory_window=self.memory_window,
         )
 
@@ -473,7 +472,7 @@ class AgentLoop:
         ollama_base = LOCAL_API_BASE.rstrip("/")
         try:
             import httpx
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            async with httpx.AsyncClient(timeout=120.0) as client:
                 await client.post(
                     f"{ollama_base}/api/chat",
                     json={

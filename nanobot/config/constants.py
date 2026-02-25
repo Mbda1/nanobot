@@ -25,8 +25,8 @@ MEMORY_CHUNK_MAX_TOKENS = 300   # summary tokens per chunk (plain text)
 MEMORY_MERGE_MAX_TOKENS = 2048  # final save_memory call
 
 # --- Timeouts (seconds) ---
-TIMEOUT_ENRICHMENT    = 10.0   # query enrichment          (loop.py)
-TIMEOUT_CHUNK_SUMMARY = 20.0   # chunk summarization       (memory.py)
+TIMEOUT_ENRICHMENT    = 10.0   # query enrichment          (enrichment.py)
+TIMEOUT_CHUNK_SUMMARY = 20.0   # chunk summarization       (memory.py) — cloud, fast
 TIMEOUT_WEB_FETCH     = 30.0   # HTTP fetch                (tools/web.py)
 
 # --- Ollama keep-alive ---

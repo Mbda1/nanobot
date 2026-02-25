@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
-
 from loguru import logger
 
+from nanobot.agent.local_llm import ollama_chat
 from nanobot.agent.usage import record as _usage_record
-from nanobot.config.constants import LOCAL_API_BASE, TIMEOUT_ENRICHMENT
+from nanobot.config.constants import TIMEOUT_ENRICHMENT
 
 
 async def enrich_query(provider, model: str, message: str) -> str:
@@ -31,33 +30,24 @@ async def enrich_query(provider, model: str, message: str) -> str:
         "Preserve the original intent exactly. "
         "Return ONLY the rewritten message — no explanation, no preamble."
     )
-    try:
-        import litellm
-        resp = await asyncio.wait_for(
-            litellm.acompletion(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": stripped},
-                ],
-                api_base=LOCAL_API_BASE,
-                max_tokens=300,
-                temperature=0.2,
-            ),
-            timeout=TIMEOUT_ENRICHMENT,
-        )
-        if hasattr(resp, "usage") and resp.usage:
-            _usage_record(model, {
-                "prompt_tokens": resp.usage.prompt_tokens,
-                "completion_tokens": resp.usage.completion_tokens,
-                "total_tokens": resp.usage.total_tokens,
-            }, source="enrichment")
-        enriched = resp.choices[0].message.content.strip()
-        if enriched:
-            logger.info("Query enriched: {} → {}", stripped[:60], enriched[:60])
-            return enriched
-    except asyncio.TimeoutError:
-        logger.debug("Query enrichment timed out, using original")
-    except Exception as exc:
-        logger.debug("Query enrichment failed: {}", exc)
+
+    # Strip "ollama/" prefix — ollama_chat takes the bare model name
+    model_name = model.split("/")[-1]
+
+    enriched, usage = await ollama_chat(
+        model_name,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": stripped},
+        ],
+        max_tokens=300,
+        temperature=0.2,
+        timeout=TIMEOUT_ENRICHMENT,
+    )
+
+    if enriched:
+        _usage_record(model, usage, source="enrichment")
+        logger.info("Query enriched: {} → {}", stripped[:60], enriched[:60])
+        return enriched
+
     return message

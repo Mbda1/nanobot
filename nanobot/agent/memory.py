@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -61,6 +60,7 @@ async def _summarize_chunk(
 ) -> str:
     """Summarize one chunk of messages as plain text. No tool call required."""
     try:
+        import asyncio
         response = await asyncio.wait_for(
             provider.chat(
                 messages=[
@@ -82,11 +82,8 @@ async def _summarize_chunk(
         )
         _usage_record(model, getattr(response, "usage", {}), source="memory_chunk")
         return (response.content or "").strip()
-    except asyncio.TimeoutError:
-        logger.warning("Chunk summary timed out, using raw fallback")
-        return chunk_text[:300]  # graceful degradation — never skip
     except Exception:
-        logger.exception("Chunk summary failed, using raw fallback")
+        logger.warning("Chunk summary failed, using raw fallback")
         return chunk_text[:300]
 
 
@@ -125,7 +122,7 @@ class MemoryStore:
     ) -> bool:
         """Consolidate old messages into MEMORY.md + HISTORY.md via chunked pipeline.
 
-        Pipeline: CHUNK (Python) → COLLECT (Mistral×N) → ASSEMBLE (Python) → MERGE (Mistral×1)
+        Pipeline: CHUNK (Python) → COLLECT (cloud×N) → ASSEMBLE (Python) → MERGE (cloud×1)
         Returns True on success (including no-op), False on failure.
         """
         if archive_all:
@@ -155,7 +152,7 @@ class MemoryStore:
         chunks = [lines[i:i + _CHUNK_SIZE] for i in range(0, len(lines), _CHUNK_SIZE)]
         logger.info("Consolidation: {} messages → {} chunks", len(lines), len(chunks))
 
-        # --- PHASE 2: COLLECT — summarize each chunk locally ---
+        # --- PHASE 2: COLLECT — summarize each chunk via cloud model ---
         partial_summaries: list[str] = []
         for idx, chunk in enumerate(chunks):
             chunk_text = "\n".join(chunk)
