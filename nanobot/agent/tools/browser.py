@@ -9,7 +9,7 @@ import os
 import re
 
 from nanobot.agent.tools.base import Tool
-from nanobot.agent.tools.web import _normalize, _strip_tags, _validate_url
+from nanobot.agent.tools.web import _normalize, _strip_tags, _validate_url, _wrap_external
 
 # Inject system libs extracted to user dir (no sudo required).
 _PLAYWRIGHT_DEPS = os.path.join(os.path.expanduser("~"), ".local", "playwright-deps", "usr", "lib")
@@ -159,7 +159,7 @@ class WebBrowseTool(Tool):
             "extractor": "playwright",
             "truncated": truncated,
             "length": len(text),
-            "text": text,
+            "text": _wrap_external(text, url),
         }, ensure_ascii=False)
 
 

@@ -45,6 +45,8 @@ TOOL_RESULT_MAX_CHARS = 500    # tool output truncation    (loop.py)
 # When exceeded, the oldest ## section is moved to memory/topics/<slug>.md (warm tier).
 # Warm-tier files are keyword-matched against the user's message and loaded on demand.
 MEMORY_HOT_MAX_LINES = 200
+MEMORY_FLUSH_THRESHOLD = 18    # soft flush to MEMORY.md before window slides (< MEMORY_WINDOW_DEFAULT)
+TIMEOUT_FLUSH = 15.0           # local-LLM flush timeout (fast, qwen2.5:7b)
 
 # --- Supervisor / delegation ---
 DELEGATE_MAX_ITERATIONS = 15   # max LLM iterations per delegated worker

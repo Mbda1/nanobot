@@ -128,6 +128,7 @@ class TelegramChannel(BaseChannel):
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
+        self._thinking_msgs: dict[str, list[int]] = {}  # chat_id -> stack of "..." message_ids
         self._pending_file = Path.home() / ".nanobot" / "workspace" / "pending_tweets.json"
         self._pending_tweets: dict[str, dict] = self._load_pending()  # sender_id -> {url, handle}
 
@@ -328,6 +329,13 @@ class TelegramChannel(BaseChannel):
 
         self._stop_typing(msg.chat_id)
 
+        # Delete all pending "..." thinking messages before sending the real response
+        for thinking_id in self._thinking_msgs.pop(msg.chat_id, []):
+            try:
+                await self._app.bot.delete_message(chat_id=int(msg.chat_id), message_id=thinking_id)
+            except Exception:
+                pass
+
         try:
             chat_id = int(msg.chat_id)
         except ValueError:
@@ -442,8 +450,13 @@ class TelegramChannel(BaseChannel):
         self._chat_ids[sender_id] = chat_id
         str_chat_id = str(chat_id)
 
-        # Acknowledge receipt immediately — user sees typing before any processing
+        # Acknowledge receipt immediately — visible before any processing
         self._start_typing(str_chat_id)
+        try:
+            thinking = await self._app.bot.send_message(chat_id=chat_id, text="...")
+            self._thinking_msgs.setdefault(str_chat_id, []).append(thinking.message_id)
+        except Exception:
+            pass
 
         # Build content from text and/or media
         content_parts = []

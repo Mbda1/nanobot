@@ -172,3 +172,34 @@ def test_get_memory_context_empty_when_no_files(tmp_path):
     store = _store(tmp_path)
     ctx = store.get_memory_context("any message")
     assert ctx == ""
+
+
+def test_warm_loading_content_match(tmp_path):
+    """A topic file is loaded when the user message matches words in file content (not stem)."""
+    store = _store(tmp_path)
+    store.memory_file.write_text("## Recent\n- fact\n", encoding="utf-8")
+
+    store.topics_dir.mkdir(parents=True, exist_ok=True)
+    # Stem "builds" has no overlap with "xylophone"; content does
+    (store.topics_dir / "builds.md").write_text(
+        "## Build Notes\n- xylophone project ongoing\n", encoding="utf-8"
+    )
+
+    ctx = store.get_memory_context("what about xylophone")
+    assert "xylophone" in ctx
+    assert "Recalled Memory" in ctx
+
+
+def test_warm_loading_top_k_limit(tmp_path):
+    """Only top_k=3 (default) topic files are returned even when more match."""
+    store = _store(tmp_path)
+    store.topics_dir.mkdir(parents=True, exist_ok=True)
+
+    for i in range(5):
+        (store.topics_dir / f"topic-{i}.md").write_text(
+            f"## Topic {i}\n- rust programming notes {i}\n", encoding="utf-8"
+        )
+
+    ctx = store.get_memory_context("rust programming")
+    # At most 3 topic blocks should appear
+    assert ctx.count("### topic-") <= 3

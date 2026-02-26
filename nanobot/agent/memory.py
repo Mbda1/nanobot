@@ -22,6 +22,7 @@ from nanobot.config.constants import (
     MEMORY_HOT_MAX_LINES,
     MEMORY_MERGE_MAX_TOKENS,
     TIMEOUT_CHUNK_SUMMARY,
+    TIMEOUT_FLUSH,
 )
 from nanobot.utils.helpers import ensure_dir
 
@@ -125,6 +126,53 @@ class MemoryStore:
         self.memory_file.write_text(content, encoding="utf-8")
         self.trim_hot()
 
+    def _append_to_hot(self, content: str) -> None:
+        """Append a new section to MEMORY.md and trim if over cap."""
+        existing = self.read_long_term()
+        sep = "\n\n" if existing.strip() else ""
+        self.memory_file.write_text(existing.rstrip() + sep + content.strip() + "\n", encoding="utf-8")
+        self.trim_hot()
+
+    async def flush_to_hot(self, messages: list[dict], local_model: str) -> bool:
+        """Lightweight local-LLM extraction of key facts → append to MEMORY.md.
+
+        Uses qwen2.5:7b (15s timeout). Runs between turns, non-blocking.
+        Returns True if anything was written.
+        """
+        from datetime import date
+        from .local_llm import ollama_chat
+
+        turns = [
+            f"{m['role'].upper()}: {(m.get('content') or '')[:400]}"
+            for m in messages
+            if m.get("role") in ("user", "assistant") and m.get("content")
+        ]
+        if not turns:
+            return False
+
+        prompt = (
+            "Review these conversation messages. Extract ONLY important persistent facts, "
+            "decisions, preferences, or context worth remembering long-term. "
+            "Output 3-7 concise bullet points. Skip small talk and routine exchanges. "
+            "If nothing is worth remembering, reply with exactly: NOTHING_TO_SAVE\n\n"
+            + "\n".join(turns)
+        )
+        bare_model = local_model.removeprefix("ollama/")
+        content, _ = await ollama_chat(
+            bare_model,
+            [{"role": "user", "content": prompt}],
+            max_tokens=200,
+            timeout=TIMEOUT_FLUSH,
+        )
+        if not content or content.strip() == "NOTHING_TO_SAVE":
+            logger.debug("Memory flush: nothing to save")
+            return False
+
+        section = f"## Memory Checkpoint ({date.today()})\n{content.strip()}"
+        self._append_to_hot(section)
+        logger.info("Memory flush: wrote checkpoint to MEMORY.md")
+        return True
+
     def trim_hot(self) -> None:
         """Overflow oldest MEMORY.md sections to topics/ when line cap is exceeded."""
         content = self.read_long_term()
@@ -167,24 +215,32 @@ class MemoryStore:
         if overflowed:
             self.memory_file.write_text("\n\n".join(raw).strip() + "\n", encoding="utf-8")
 
-    def _load_warm_topics(self, user_message: str) -> str:
-        """Return content of topic files whose stems keyword-match the user message."""
+    def _load_warm_topics(self, user_message: str, top_k: int = 3) -> str:
+        """Return top-K topic files scored by stem+content keyword overlap."""
         if not user_message or not self.topics_dir.exists():
             return ""
 
-        words = set(re.findall(r"\b[a-z]{4,}\b", user_message.lower())) - self._STOP_WORDS
-        if not words:
+        query = set(re.findall(r"\b[a-z]{4,}\b", user_message.lower())) - self._STOP_WORDS
+        if not query:
             return ""
 
-        loaded: list[str] = []
+        scored: list[tuple[float, Path, str]] = []
         for topic_file in sorted(self.topics_dir.glob("*.md")):
-            # Topic keywords come from the file stem (e.g. "car-garage" → {"garage"})
+            content = topic_file.read_text(encoding="utf-8").strip()
             stem_words = set(re.findall(r"\b[a-z]{4,}\b", topic_file.stem.lower()))
-            if words & stem_words:
-                content = topic_file.read_text(encoding="utf-8").strip()
-                if content:
-                    loaded.append(f"### {topic_file.stem}\n{content}")
-                    logger.debug("Warm memory loaded: {}", topic_file.stem)
+            content_words = set(re.findall(r"\b[a-z]{4,}\b", content.lower())) - self._STOP_WORDS
+            stem_hits = len(query & stem_words)
+            content_hits = len(query & (content_words - stem_words))
+            score = stem_hits * 3.0 + content_hits * 1.0
+            if score > 0 and content:
+                scored.append((score, topic_file, content))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        loaded = []
+        for score, topic_file, content in scored[:top_k]:
+            loaded.append(f"### {topic_file.stem}\n{content}")
+            logger.debug("Warm memory loaded: {} (score={:.0f})", topic_file.stem, score)
 
         return "\n\n".join(loaded)
 

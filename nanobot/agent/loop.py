@@ -18,6 +18,7 @@ from nanobot.agent.usage import init as _usage_init, record as _usage_record
 from nanobot.config.constants import (
     CIRCUIT_BREAKER_CONSECUTIVE,
     CIRCUIT_BREAKER_PER_TOOL,
+    MEMORY_FLUSH_THRESHOLD,
     TOOL_RESULT_MAX_CHARS,
 )
 from nanobot.agent.subagent import SubagentManager
@@ -111,6 +112,8 @@ class AgentLoop:
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: dict[str, asyncio.Lock] = {}
+        self._flushing: set[str] = set()              # Session keys with flush in progress
+        self._flush_hwm: dict[str, int] = {}          # session_key → message count at last flush
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -297,6 +300,10 @@ class AgentLoop:
                     )
             else:
                 final_content = self._strip_think(response.content)
+                messages = self.context.add_assistant_message(
+                    messages, final_content,
+                    reasoning_content=response.reasoning_content,
+                )
                 break
 
         if final_content is None and iteration >= self.max_iterations:
@@ -444,6 +451,7 @@ class AgentLoop:
                         await self._consolidate_memory(session)
                 finally:
                     self._consolidating.discard(session.key)
+                    self._flush_hwm.pop(session.key, None)   # allow fresh flush next cycle
                     self._prune_consolidation_lock(session.key, lock)
                     _task = asyncio.current_task()
                     if _task is not None:
@@ -486,6 +494,31 @@ class AgentLoop:
 
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
+
+        # Memory flush: fire once per consolidation cycle when approaching memory_window
+        unconsolidated_after = len(session.messages) - session.last_consolidated
+        flushed_at = self._flush_hwm.get(session.key, 0)
+        if (
+            unconsolidated_after >= MEMORY_FLUSH_THRESHOLD
+            and len(session.messages) > flushed_at
+            and session.key not in self._flushing
+            and session.key not in self._consolidating
+            and self.local_model
+        ):
+            self._flushing.add(session.key)
+            self._flush_hwm[session.key] = len(session.messages)
+            flush_msgs = list(session.messages[session.last_consolidated:])
+            _flush_session_key = session.key
+
+            async def _flush_and_unlock():
+                try:
+                    await MemoryStore(self.workspace).flush_to_hot(flush_msgs, self.local_model)
+                except Exception as exc:
+                    logger.warning("Memory flush error: {}", exc)
+                finally:
+                    self._flushing.discard(_flush_session_key)
+
+            asyncio.create_task(_flush_and_unlock())
 
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
