@@ -10,10 +10,11 @@ Quick reference:
 """
 
 # --- Models ---
-CLOUD_MODEL_DEFAULT = "openrouter/anthropic/claude-haiku-4-5"
-LOCAL_MODEL_DEFAULT = "ollama/qwen2.5:7b"    # enrichment + memory (fast, ~27 tok/s)
-JUDGE_MODEL_DEFAULT = "ollama/mistral-nemo"  # eval judge + supervisor (quality, ~16 tok/s)
-LOCAL_API_BASE      = "http://host.docker.internal:11434"
+CLOUD_MODEL_DEFAULT  = "openrouter/anthropic/claude-haiku-4-5"
+LOCAL_MODEL_DEFAULT  = "ollama/qwen2.5:7b"    # enrichment + memory (fast, ~27 tok/s)
+JUDGE_MODEL_DEFAULT  = "ollama/mistral-nemo"  # eval judge + supervisor (quality, ~16 tok/s)
+EMBED_MODEL_DEFAULT  = "nomic-embed-text"     # semantic warm-tier search (274 MB, 768-dim)
+LOCAL_API_BASE       = "http://host.docker.internal:11434"
 
 # --- Agent limits ---
 MAX_TOKENS_DEFAULT    = 4096
@@ -28,6 +29,7 @@ MEMORY_MERGE_MAX_TOKENS = 2048  # final save_memory call
 
 # --- Timeouts (seconds) ---
 TIMEOUT_ENRICHMENT    = 10.0   # query enrichment          (enrichment.py)
+TIMEOUT_EMBED         =  5.0   # semantic embedding        (embeddings.py) — fast model, fail-fast
 TIMEOUT_CHUNK_SUMMARY = 20.0   # chunk summarization       (memory.py) — cloud, fast
 TIMEOUT_WEB_FETCH     = 30.0   # HTTP fetch                (tools/web.py)
 TIMEOUT_JUDGE         = 60.0   # LLM-as-judge eval         (eval.py) — Nemo 12B needs headroom on cold start
@@ -43,10 +45,11 @@ TOOL_RESULT_MAX_CHARS = 500    # tool output truncation    (loop.py)
 # --- Memory tiering ---
 # MEMORY.md is capped at this many lines (hot tier).
 # When exceeded, the oldest ## section is moved to memory/topics/<slug>.md (warm tier).
-# Warm-tier files are keyword-matched against the user's message and loaded on demand.
-MEMORY_HOT_MAX_LINES = 200
+# Warm-tier files are matched via cosine similarity (semantic) then keyword fallback.
+MEMORY_HOT_MAX_LINES   = 200
+SIMILARITY_THRESHOLD   = 0.50  # minimum cosine similarity to load a warm-tier topic
 MEMORY_FLUSH_THRESHOLD = 18    # soft flush to MEMORY.md before window slides (< MEMORY_WINDOW_DEFAULT)
-TIMEOUT_FLUSH = 15.0           # local-LLM flush timeout (fast, qwen2.5:7b)
+TIMEOUT_FLUSH = 30.0           # local-LLM flush timeout (qwen2.5:7b, pinned in RAM)
 
 # --- Supervisor / delegation ---
 DELEGATE_MAX_ITERATIONS = 15   # max LLM iterations per delegated worker

@@ -293,16 +293,23 @@ def gateway(
 
     # Set up persistent log file for supervisor
     from loguru import logger as _logger
+    from nanobot.utils.tracing import get_trace_id
+
+    def trace_filter(record):
+        record["extra"]["trace_id"] = get_trace_id() or "none"
+        return True
+
     _log_dir = get_data_dir() / "logs"
     _log_dir.mkdir(parents=True, exist_ok=True)
     _log_file = _log_dir / "nanobot.log"
+    _logger.configure(patcher=trace_filter)
     _logger.enable("nanobot")
     _logger.add(
         str(_log_file),
         rotation="10 MB",
         retention="7 days",
         level="DEBUG",
-        format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | {name}:{line} - {message}",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level:<8} | [{extra[trace_id]}] {name}:{line} - {message}",
     )
 
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
@@ -1149,7 +1156,14 @@ def supervisor(
     """Run the supervisor daemon — monitors nanobot logs and applies autonomous fixes."""
     from nanobot.config.loader import load_config, get_data_dir
     from nanobot.supervisor.daemon import run_supervisor
+    from loguru import logger as _logger
+    from nanobot.utils.tracing import get_trace_id
 
+    def trace_filter(record):
+        record["extra"]["trace_id"] = get_trace_id() or "none"
+        return True
+
+    _logger.configure(patcher=trace_filter)
     config = load_config()
     log_file = get_data_dir() / "logs" / "nanobot.log"
     audit_log = config.workspace_path / "memory" / "SUPERVISOR_LOG.md"

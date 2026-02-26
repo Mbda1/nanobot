@@ -27,7 +27,7 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
     
-    def build_system_prompt(
+    async def build_system_prompt(
         self,
         skill_names: list[str] | None = None,
         user_message: str = "",
@@ -37,7 +37,7 @@ class ContextBuilder:
 
         Args:
             skill_names: Optional list of skills to include.
-            user_message: Current user message — used for warm-tier keyword matching.
+            user_message: Current user message — used for warm-tier topic matching.
 
         Returns:
             Complete system prompt.
@@ -52,8 +52,8 @@ class ContextBuilder:
         if bootstrap:
             parts.append(bootstrap)
 
-        # Memory context (hot tier always + warm tier on keyword match)
-        memory = self.memory.get_memory_context(user_message)
+        # Memory context (hot tier always + warm tier on semantic/keyword match)
+        memory = await self.memory.get_memory_context(user_message)
         if memory:
             parts.append(f"# Memory\n\n{memory}")
         
@@ -139,7 +139,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         
         return "\n\n".join(parts) if parts else ""
     
-    def build_messages(
+    async def build_messages(
         self,
         history: list[dict[str, Any]],
         current_message: str,
@@ -166,7 +166,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
         # System prompt — pass current_message for warm-tier topic matching.
         msg_text = current_message if isinstance(current_message, str) else ""
-        system_prompt = self.build_system_prompt(skill_names, user_message=msg_text)
+        system_prompt = await self.build_system_prompt(skill_names, user_message=msg_text)
         messages.append({"role": "system", "content": system_prompt})
 
         # History

@@ -114,6 +114,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
         BotCommand("help", "Show available commands"),
+        BotCommand("search", "Search conversation history"),
     ]
     
     def __init__(
@@ -503,14 +504,17 @@ class TelegramChannel(BaseChannel):
                 
                 # Handle voice transcription
                 if media_type == "voice" or media_type == "audio":
-                    from nanobot.providers.transcription import GroqTranscriptionProvider
-                    transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
-                    transcription = await transcriber.transcribe(file_path)
+                    transcription = await self._transcribe(file_path)
                     if transcription:
                         logger.info("Transcribed {}: {}...", media_type, transcription[:50])
-                        content_parts.append(f"[transcription: {transcription}]")
+                        content_parts.append(f"[voice message: {transcription}]")
                     else:
-                        content_parts.append(f"[{media_type}: {file_path}]")
+                        content_parts.append("[voice message received — transcription unavailable]")
+                elif media_type == "image":
+                    # Image is base64-encoded and sent to the LLM via media_paths.
+                    # Only add text if there's no caption (caption is already in content_parts).
+                    if not message.caption:
+                        content_parts.append("[photo]")
                 else:
                     content_parts.append(f"[{media_type}: {file_path}]")
                     
@@ -603,6 +607,20 @@ class TelegramChannel(BaseChannel):
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
         logger.error("Telegram error: {}", context.error)
+
+    async def _transcribe(self, file_path: Path) -> str:
+        """Try Groq transcription first; fall back to local Whisper if Groq key absent."""
+        from nanobot.providers.transcription import GroqTranscriptionProvider, LocalWhisperProvider
+
+        if self.groq_api_key:
+            result = await GroqTranscriptionProvider(api_key=self.groq_api_key).transcribe(file_path)
+            if result:
+                return result
+            logger.warning("Groq transcription returned empty, falling back to local whisper")
+
+        # Local Whisper fallback (tiny model, CPU, ~1-3s warm)
+        result = await LocalWhisperProvider().transcribe(file_path)
+        return result
 
     def _get_extension(self, media_type: str, mime_type: str | None) -> str:
         """Get file extension based on media type."""

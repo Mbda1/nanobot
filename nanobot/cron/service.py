@@ -235,6 +235,8 @@ class CronService:
     
     async def _execute_job(self, job: CronJob) -> None:
         """Execute a single job."""
+        from nanobot.utils.tracing import set_trace_id
+        set_trace_id(f"cron-{job.id}")
         start_ms = _now_ms()
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
         

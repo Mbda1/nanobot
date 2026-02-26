@@ -13,7 +13,7 @@ import asyncio
 import httpx
 from loguru import logger
 
-from nanobot.config.constants import LOCAL_API_BASE
+from nanobot.config.constants import LOCAL_API_BASE, OLLAMA_KEEP_ALIVE
 
 
 async def ollama_chat(
@@ -34,6 +34,7 @@ async def ollama_chat(
         "model": model_name,
         "messages": messages,
         "stream": False,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
         "options": {
             "num_predict": max_tokens,
             "temperature": temperature,
