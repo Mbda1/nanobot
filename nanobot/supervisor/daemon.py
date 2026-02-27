@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import json
 import os
 import signal
@@ -15,6 +16,21 @@ from typing import AsyncIterator
 from loguru import logger
 
 from nanobot.config.constants import JUDGE_MODEL_DEFAULT, LOCAL_API_BASE
+
+
+# ---------------------------------------------------------------------------
+# Restart policy guards
+# ---------------------------------------------------------------------------
+
+# Avoid restart storms: require repeated timeout-like criticals before auto-restart.
+_TIMEOUT_ESCALATION_WINDOW_S = 10 * 60
+_TIMEOUT_ESCALATION_THRESHOLD = 3
+
+# Global cooldown between automatic restart attempts.
+_RESTART_COOLDOWN_S = 3 * 60
+
+_timeout_critical_events: deque[float] = deque()
+_last_restart_at: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +137,8 @@ async def detect_issues(lines: list[str]) -> list[dict]:
 
 async def apply_fix(issue: dict, config, workspace: Path) -> str:
     """Execute the fix described in *issue* and return a human-readable result string."""
+    global _last_restart_at
+
     fix_type = issue.get("fix_type", "none")
     details = issue.get("fix_details", {}) or {}
 
@@ -134,6 +152,35 @@ async def apply_fix(issue: dict, config, workspace: Path) -> str:
 
     try:
         if fix_type == "restart_gateway":
+            now = time.monotonic()
+
+            # Autonomous restart is reserved for gateway-health failures only.
+            # Local-model faults and generic message-processing errors should
+            # not bounce an otherwise running gateway.
+            if not _is_gateway_health_issue(issue):
+                return "restart skipped: issue is not gateway-health critical"
+
+            # Enforce cooldown for all restart attempts.
+            if now - _last_restart_at < _RESTART_COOLDOWN_S:
+                remain = int(_RESTART_COOLDOWN_S - (now - _last_restart_at))
+                return f"restart skipped: cooldown active ({remain}s remaining)"
+
+            # Timeout-like failures are usually transient; require repeated events
+            # in a time window before escalating to restart.
+            if _is_timeout_like_issue(issue):
+                _timeout_critical_events.append(now)
+                while _timeout_critical_events and (
+                    now - _timeout_critical_events[0] > _TIMEOUT_ESCALATION_WINDOW_S
+                ):
+                    _timeout_critical_events.popleft()
+
+                if len(_timeout_critical_events) < _TIMEOUT_ESCALATION_THRESHOLD:
+                    return (
+                        "restart skipped: timeout-like issue below escalation threshold "
+                        f"({len(_timeout_critical_events)}/{_TIMEOUT_ESCALATION_THRESHOLD} "
+                        f"in {_TIMEOUT_ESCALATION_WINDOW_S}s)"
+                    )
+
             return await _restart_gateway()
 
         return "no fix applied"
@@ -146,15 +193,13 @@ async def apply_fix(issue: dict, config, workspace: Path) -> str:
 
 async def _restart_gateway() -> str:
     """Kill the running gateway process and start a fresh one."""
+    global _last_restart_at
+
     # Send SIGTERM to any process with 'nanobot gateway' in its command line
     killed = False
+    pids: list[str] = []
     try:
-        result = subprocess.run(
-            ["pgrep", "-f", "nanobot gateway"],
-            capture_output=True,
-            text=True,
-        )
-        pids = [p.strip() for p in result.stdout.splitlines() if p.strip()]
+        pids = [str(p) for p in _gateway_pids()]
         for pid in pids:
             try:
                 os.kill(int(pid), signal.SIGTERM)
@@ -190,12 +235,22 @@ async def _restart_gateway() -> str:
 
     # Spawn a new gateway (detached)
     try:
+        # If one survived shutdown, do not spawn another copy.
+        alive = _gateway_pids()
+        if alive:
+            _ensure_single_gateway_instance()
+            _last_restart_at = time.monotonic()
+            return f"restart skipped: gateway still running (pids={alive})"
+
         subprocess.Popen(
             ["nanobot", "gateway"],
             start_new_session=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        await asyncio.sleep(1.0)
+        _ensure_single_gateway_instance()
+        _last_restart_at = time.monotonic()
         return f"gateway {'restarted' if killed else 'started'}"
     except FileNotFoundError:
         return "restart failed: nanobot not found in PATH"
@@ -284,15 +339,76 @@ async def notify_telegram(issue: dict, result: str, config) -> None:
 
 def _gateway_running() -> bool:
     """Return True if a 'nanobot gateway' process is currently running."""
+    return bool(_gateway_pids())
+
+
+def _gateway_pids() -> list[int]:
+    """Return all running 'nanobot gateway' PIDs."""
     try:
         result = subprocess.run(
             ["pgrep", "-f", "nanobot gateway"],
             capture_output=True,
             text=True,
         )
-        return bool(result.stdout.strip())
+        out = []
+        for raw in result.stdout.splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                out.append(int(raw))
+            except ValueError:
+                continue
+        return out
     except FileNotFoundError:
-        return False
+        return []
+
+
+def _ensure_single_gateway_instance() -> list[int]:
+    """Best-effort dedupe to one gateway process, keeping newest PID."""
+    pids = _gateway_pids()
+    uniq = sorted(set(pids))
+    if len(uniq) <= 1:
+        return uniq
+
+    keep = max(uniq)
+    for pid in uniq:
+        if pid == keep:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    logger.warning("[supervisor] deduped gateway instances: kept {}, terminated {}", keep, [p for p in uniq if p != keep])
+    return _gateway_pids()
+
+
+def _is_timeout_like_issue(issue: dict) -> bool:
+    """Return True if issue text indicates a timeout/transient slowness pattern."""
+    desc = str(issue.get("description", "")).lower()
+    details = issue.get("fix_details", {}) or {}
+    suggestion = str(details.get("suggestion", "")).lower()
+    text = f"{desc}\n{suggestion}"
+    markers = ("readtimeout", "request timed out", "timeout", "timed out")
+    return any(m in text for m in markers)
+
+
+def _is_gateway_health_issue(issue: dict) -> bool:
+    """Return True only for issues that indicate gateway process health failure."""
+    desc = str(issue.get("description", "")).lower()
+    details = issue.get("fix_details", {}) or {}
+    suggestion = str(details.get("suggestion", "")).lower()
+    text = f"{desc}\n{suggestion}"
+    markers = (
+        "gateway crash",
+        "gateway crashed",
+        "gateway unresponsive",
+        "gateway process gone",
+        "gateway not running",
+        "process unresponsive",
+        "telegram gateway unresponsive",
+    )
+    return any(m in text for m in markers)
 
 
 async def watch_gateway(config, poll_interval: int = 30) -> None:
@@ -301,6 +417,7 @@ async def watch_gateway(config, poll_interval: int = 30) -> None:
 
     while True:
         await asyncio.sleep(poll_interval)
+        _ensure_single_gateway_instance()
         running = _gateway_running()
 
         if was_running and not running:

@@ -185,6 +185,25 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _phase_from_tool_hint(hint: str) -> str | None:
+        """Map a tool hint string to a coarse progress phase."""
+        m = re.match(r"\s*([a-zA-Z_][a-zA-Z0-9_]*)\(", hint or "")
+        if not m:
+            return None
+        tool = m.group(1).lower()
+        if tool in {"delegate", "spawn"}:
+            return "researching in parallel"
+        if tool in {"web_search", "web_fetch", "web_browse"}:
+            return "gathering sources"
+        if tool in {"read_file", "list_dir"}:
+            return "reviewing files"
+        if tool in {"write_file", "edit_file"}:
+            return "writing draft"
+        if tool == "exec":
+            return "running checks"
+        return None
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -382,7 +401,7 @@ class AgentLoop:
             session = self.sessions.get_or_create(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=self.memory_window)
-            messages = self.context.build_messages(
+            messages = await self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
@@ -459,24 +478,89 @@ class AgentLoop:
 
         history = session.get_history(max_messages=self.memory_window)
         enriched_content = await enrich_query(self.provider, self.local_model, msg.content)
-        initial_messages = self.context.build_messages(
+        initial_messages = await self.context.build_messages(
             history=history,
             current_message=enriched_content,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
         )
 
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+        progress_state = {
+            "started_at": asyncio.get_running_loop().time(),
+            "last_sent_at": 0.0,
+            "sent_count": 0,
+            "phases": set(),
+        }
+        progress_lock = asyncio.Lock()
+        progress_task: asyncio.Task | None = None
+        progress_enabled = msg.channel != "cli"
+        progress_start_delay_s = 20.0
+        progress_interval_s = 45.0
+        progress_max_messages = 5
+
+        async def _emit_progress(text: str, *, tool_hint: bool = False) -> None:
+            if not progress_enabled:
+                return
+            async with progress_lock:
+                if progress_state["sent_count"] >= progress_max_messages:
+                    return
+                progress_state["last_sent_at"] = asyncio.get_running_loop().time()
+                progress_state["sent_count"] += 1
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
             await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
+                channel=msg.channel, chat_id=msg.chat_id, content=text, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
-        )
+        async def _heartbeat_loop() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(progress_interval_s)
+                    now = asyncio.get_running_loop().time()
+                    elapsed = now - progress_state["started_at"]
+                    if elapsed < progress_start_delay_s:
+                        continue
+                    if (now - progress_state["last_sent_at"]) < progress_interval_s:
+                        continue
+                    await _emit_progress(
+                        "Still working on this. I will send the final answer as soon as it's ready."
+                    )
+            except asyncio.CancelledError:
+                return
+
+        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+            if not progress_enabled:
+                return
+            if not tool_hint:
+                return
+            now = asyncio.get_running_loop().time()
+            elapsed = now - progress_state["started_at"]
+            phase = self._phase_from_tool_hint(content)
+            if phase and phase not in progress_state["phases"] and elapsed >= progress_start_delay_s:
+                progress_state["phases"].add(phase)
+                await _emit_progress(f"Progress: {phase}.")
+                return
+            if elapsed >= progress_start_delay_s and (now - progress_state["last_sent_at"]) >= progress_interval_s:
+                await _emit_progress(
+                    "Still working on this. I will send the final answer as soon as it's ready."
+                )
+
+        if progress_enabled:
+            await _emit_progress("Working on it now. This can take a few minutes for deep research.")
+            progress_task = asyncio.create_task(_heartbeat_loop())
+
+        try:
+            final_content, _, all_msgs = await self._run_agent_loop(
+                initial_messages, on_progress=on_progress or _bus_progress,
+            )
+        finally:
+            if progress_task:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -513,40 +597,68 @@ class AgentLoop:
 
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
-        return await MemoryStore(self.workspace).consolidate(
-            session, self.provider, self.model,
-            archive_all=archive_all, memory_window=self.memory_window,
-        )
+        from nanobot.config.constants import TIMEOUT_MEMORY_CONSOLIDATION
+        try:
+            return await asyncio.wait_for(
+                MemoryStore(self.workspace).consolidate(
+                    session, self.provider, self.model,
+                    archive_all=archive_all, memory_window=self.memory_window,
+                ),
+                timeout=TIMEOUT_MEMORY_CONSOLIDATION,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Memory consolidation timed out after {}s, skipping this run",
+                TIMEOUT_MEMORY_CONSOLIDATION,
+            )
+            return False
 
     async def _warmup_local_model(self) -> None:
-        """Load the local model into Ollama RAM with keep_alive=-1 (never unload).
+        """Warm up local model on supported backends.
 
-        LiteLLM silently drops the keep_alive param, so we call the Ollama
-        /api/chat endpoint directly. keep_alive=-1 pins the model in RAM until
-        Ollama itself is restarted — eliminates cold-start timeouts entirely.
+        For Ollama we use keep_alive=-1 to pin model in RAM.
+        For OpenAI-compatible backends (e.g. llama.cpp), issue a tiny prompt
+        to prime model load without Ollama-only params.
         """
         if not self.local_model:
             return
         # Extract bare model name (e.g. "ollama/mistral" → "mistral")
         model_name = self.local_model.split("/")[-1]
-        from nanobot.config.constants import LOCAL_API_BASE
-        ollama_base = LOCAL_API_BASE.rstrip("/")
+        from nanobot.config.constants import LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_LLM_BACKEND
+        local_base = LOCAL_API_BASE.rstrip("/")
         try:
             import httpx
             async with httpx.AsyncClient(timeout=120.0) as client:
-                await client.post(
-                    f"{ollama_base}/api/chat",
-                    json={
-                        "model": model_name,
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "stream": False,
-                        "keep_alive": -1,
-                        "options": {"num_predict": 1},
-                    },
-                )
-            logger.info("Local model pinned in RAM: {} (keep_alive=-1)", model_name)
+                if LOCAL_LLM_BACKEND in {"openai", "llamacpp", "llama.cpp"}:
+                    headers = {"Content-Type": "application/json"}
+                    if LOCAL_API_KEY:
+                        headers["Authorization"] = f"Bearer {LOCAL_API_KEY}"
+                    await client.post(
+                        f"{local_base}/v1/chat/completions",
+                        headers=headers,
+                        json={
+                            "model": model_name,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "max_tokens": 1,
+                            "temperature": 0.0,
+                            "stream": False,
+                        },
+                    )
+                    logger.info("Local model warmup complete: {} (backend={})", model_name, LOCAL_LLM_BACKEND)
+                else:
+                    await client.post(
+                        f"{local_base}/api/chat",
+                        json={
+                            "model": model_name,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": False,
+                            "keep_alive": -1,
+                            "options": {"num_predict": 1},
+                        },
+                    )
+                    logger.info("Local model pinned in RAM: {} (keep_alive=-1)", model_name)
         except Exception as exc:
-            logger.debug("Local model warmup skipped (Ollama may be offline): {}", exc)
+            logger.debug("Local model warmup skipped (backend={}): {}", LOCAL_LLM_BACKEND, exc)
 
     async def process_direct(
         self,
