@@ -145,3 +145,31 @@ class TestMemoryConsolidationTypeHandling:
 
         assert result is True
         provider.chat.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_chunk_fail_fast_skips_remaining_llm_calls(self, tmp_path: Path) -> None:
+        """After repeated chunk failures, remaining chunk summaries should bypass LLM calls."""
+        store = MemoryStore(tmp_path)
+        provider = AsyncMock()
+
+        # First two chunk summaries fail -> fail-fast.
+        # Next call is merge and should still succeed.
+        provider.chat = AsyncMock(
+            side_effect=[
+                RuntimeError("timeout 1"),
+                RuntimeError("timeout 2"),
+                _make_tool_response(
+                    history_entry="[2026-01-01] Consolidation fallback path used.",
+                    memory_update="# Memory\nFallback summary captured.",
+                ),
+            ]
+        )
+
+        # Enough messages to produce multiple chunks.
+        session = _make_session(message_count=120)
+
+        result = await store.consolidate(session, provider, "test-model", memory_window=50)
+
+        assert result is True
+        # 2 failed chunk calls + 1 merge call; remaining chunks should not call provider.
+        assert provider.chat.call_count == 3

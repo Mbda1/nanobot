@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -19,11 +20,13 @@ from nanobot.agent.usage import record as _usage_record, record_metric as _recor
 from nanobot.config.constants import (
     MEMORY_CHUNK_SIZE,
     MEMORY_CHUNK_MAX_TOKENS,
+    MEMORY_CHUNK_FAIL_FAST_THRESHOLD,
     MEMORY_HOT_MAX_LINES,
     MEMORY_MERGE_MAX_TOKENS,
     SIMILARITY_THRESHOLD,
     TIMEOUT_CHUNK_SUMMARY,
     TIMEOUT_FLUSH,
+    TIMEOUT_MEMORY_CONSOLIDATION,
 )
 from nanobot.utils.helpers import ensure_dir
 
@@ -67,8 +70,11 @@ async def _summarize_chunk(
     provider: LLMProvider,
     model: str,
     chunk_text: str,
-) -> str:
-    """Summarize one chunk of messages as plain text. No tool call required."""
+) -> tuple[str, bool]:
+    """Summarize one chunk of messages as plain text. No tool call required.
+
+    Returns (summary, used_fallback).
+    """
     try:
         import asyncio
         response = await asyncio.wait_for(
@@ -91,10 +97,10 @@ async def _summarize_chunk(
             timeout=TIMEOUT_CHUNK_SUMMARY,
         )
         _usage_record(model, getattr(response, "usage", {}), source="memory_chunk")
-        return (response.content or "").strip()
+        return (response.content or "").strip(), False
     except Exception:
         logger.warning("Chunk summary failed, using raw fallback")
-        return chunk_text[:300]
+        return chunk_text[:300], True
 
 
 class MemoryStore:
@@ -411,10 +417,36 @@ class MemoryStore:
 
         # --- PHASE 2: COLLECT — summarize each chunk via cloud model ---
         partial_summaries: list[str] = []
+        _chunk_failures = 0
+        _started_at = time.monotonic()
         for idx, chunk in enumerate(chunks):
+            if (time.monotonic() - _started_at) > TIMEOUT_MEMORY_CONSOLIDATION:
+                logger.warning(
+                    "Consolidation time budget exceeded ({}s), using raw fallback for remaining chunks",
+                    TIMEOUT_MEMORY_CONSOLIDATION,
+                )
+                for rem_idx, rem_chunk in enumerate(chunks[idx:], start=idx + 1):
+                    rem_text = "\n".join(rem_chunk)
+                    partial_summaries.append(f"[Segment {rem_idx}/{len(chunks)}] {rem_text[:300]}")
+                break
+
             chunk_text = "\n".join(chunk)
-            summary = await _summarize_chunk(provider, model, chunk_text)
+            summary, used_fallback = await _summarize_chunk(provider, model, chunk_text)
             partial_summaries.append(f"[Segment {idx + 1}/{len(chunks)}] {summary}")
+            if used_fallback:
+                _chunk_failures += 1
+            else:
+                _chunk_failures = 0
+
+            if _chunk_failures >= MEMORY_CHUNK_FAIL_FAST_THRESHOLD:
+                logger.warning(
+                    "Consolidation fail-fast triggered after {} chunk failures, using raw fallback for remaining chunks",
+                    _chunk_failures,
+                )
+                for rem_idx, rem_chunk in enumerate(chunks[idx + 1:], start=idx + 2):
+                    rem_text = "\n".join(rem_chunk)
+                    partial_summaries.append(f"[Segment {rem_idx}/{len(chunks)}] {rem_text[:300]}")
+                break
 
         # --- PHASE 3: ASSEMBLE (Python, zero tokens) ---
         assembled = "\n\n".join(partial_summaries)

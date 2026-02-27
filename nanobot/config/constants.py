@@ -26,11 +26,13 @@ MEMORY_WINDOW_DEFAULT = 25
 MEMORY_CHUNK_SIZE       = 8     # messages per chunk
 MEMORY_CHUNK_MAX_TOKENS = 300   # summary tokens per chunk (plain text)
 MEMORY_MERGE_MAX_TOKENS = 2048  # final save_memory call
+MEMORY_CHUNK_FAIL_FAST_THRESHOLD = 2  # after N chunk summary failures, skip LLM for remaining chunks
 
 # --- Timeouts (seconds) ---
 TIMEOUT_ENRICHMENT    = 10.0   # query enrichment          (enrichment.py)
 TIMEOUT_EMBED         =  5.0   # semantic embedding        (embeddings.py) — fast model, fail-fast
 TIMEOUT_CHUNK_SUMMARY = 20.0   # chunk summarization       (memory.py) — cloud, fast
+TIMEOUT_MEMORY_CONSOLIDATION = 60.0   # total consolidation budget per run
 TIMEOUT_WEB_FETCH     = 30.0   # HTTP fetch                (tools/web.py)
 TIMEOUT_JUDGE         = 60.0   # LLM-as-judge eval         (eval.py) — Nemo 12B needs headroom on cold start
 

@@ -455,28 +455,6 @@ class AgentLoop:
             result = await self._search_sessions(query)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=result)
 
-        unconsolidated = len(session.messages) - session.last_consolidated
-        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
-            self._consolidating.add(session.key)
-            lock = self._get_consolidation_lock(session.key)
-
-            async def _consolidate_and_unlock():
-                from nanobot.utils.tracing import set_trace_id
-                set_trace_id(f"mem-{session.key[:4]}")
-                try:
-                    async with lock:
-                        await self._consolidate_memory(session)
-                finally:
-                    self._consolidating.discard(session.key)
-                    self._flush_hwm.pop(session.key, None)   # allow fresh flush next cycle
-                    self._prune_consolidation_lock(session.key, lock)
-                    _task = asyncio.current_task()
-                    if _task is not None:
-                        self._consolidation_tasks.discard(_task)
-
-            _task = asyncio.create_task(_consolidate_and_unlock())
-            self._consolidation_tasks.add(_task)
-
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
@@ -542,6 +520,29 @@ class AgentLoop:
                     self._flushing.discard(_flush_session_key)
 
             asyncio.create_task(_flush_and_unlock())
+
+        # Memory consolidation: scheduled AFTER response is sent so the main
+        # Ollama request is never queued behind consolidation's chunk calls.
+        if (unconsolidated_after >= self.memory_window and session.key not in self._consolidating):
+            self._consolidating.add(session.key)
+            lock = self._get_consolidation_lock(session.key)
+
+            async def _consolidate_and_unlock():
+                from nanobot.utils.tracing import set_trace_id
+                set_trace_id(f"mem-{session.key[:4]}")
+                try:
+                    async with lock:
+                        await self._consolidate_memory(session)
+                finally:
+                    self._consolidating.discard(session.key)
+                    self._flush_hwm.pop(session.key, None)   # allow fresh flush next cycle
+                    self._prune_consolidation_lock(session.key, lock)
+                    _ctask = asyncio.current_task()
+                    if _ctask is not None:
+                        self._consolidation_tasks.discard(_ctask)
+
+            _ctask = asyncio.create_task(_consolidate_and_unlock())
+            self._consolidation_tasks.add(_ctask)
 
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
@@ -635,10 +636,22 @@ class AgentLoop:
 
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
-        return await MemoryStore(self.workspace).consolidate(
-            session, self.provider, self.model,
-            archive_all=archive_all, memory_window=self.memory_window,
-        )
+        import asyncio
+        from nanobot.config.constants import TIMEOUT_MEMORY_CONSOLIDATION
+        try:
+            return await asyncio.wait_for(
+                MemoryStore(self.workspace).consolidate(
+                    session, self.provider, self.model,
+                    archive_all=archive_all, memory_window=self.memory_window,
+                ),
+                timeout=TIMEOUT_MEMORY_CONSOLIDATION,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Memory consolidation timed out after {}s, skipping this run",
+                TIMEOUT_MEMORY_CONSOLIDATION,
+            )
+            return False
 
     async def _warmup_local_model(self) -> None:
         """Load the local model into Ollama RAM with keep_alive=-1 (never unload).
@@ -655,7 +668,7 @@ class AgentLoop:
         ollama_base = LOCAL_API_BASE.rstrip("/")
         try:
             import httpx
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=300.0) as client:
                 await client.post(
                     f"{ollama_base}/api/chat",
                     json={

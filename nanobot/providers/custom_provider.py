@@ -19,8 +19,11 @@ class CustomProvider(LLMProvider):
 
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
                    model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7) -> LLMResponse:
+        m = (model or self.default_model)
+        if m.startswith("custom/"):
+            m = m[len("custom/"):]  # "custom/qwen3.5:27b" → "qwen3.5:27b"
         kwargs: dict[str, Any] = {
-            "model": model or self.default_model,
+            "model": m,
             "messages": self._sanitize_empty_content(messages),
             "max_tokens": max(1, max_tokens),
             "temperature": temperature,
