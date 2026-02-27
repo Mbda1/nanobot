@@ -114,6 +114,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("start", "Start the bot"),
         BotCommand("new", "Start a new conversation"),
         BotCommand("help", "Show available commands"),
+        BotCommand("search", "Search conversation history"),
     ]
     
     def __init__(
@@ -128,6 +129,7 @@ class TelegramChannel(BaseChannel):
         self._app: Application | None = None
         self._chat_ids: dict[str, int] = {}  # Map sender_id to chat_id for replies
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
+        self._thinking_msgs: dict[str, list[int]] = {}  # chat_id -> stack of "..." message_ids
         self._pending_file = Path.home() / ".nanobot" / "workspace" / "pending_tweets.json"
         self._pending_tweets: dict[str, dict] = self._load_pending()  # sender_id -> {url, handle}
 
@@ -328,6 +330,13 @@ class TelegramChannel(BaseChannel):
 
         self._stop_typing(msg.chat_id)
 
+        # Delete all pending "..." thinking messages before sending the real response
+        for thinking_id in self._thinking_msgs.pop(msg.chat_id, []):
+            try:
+                await self._app.bot.delete_message(chat_id=int(msg.chat_id), message_id=thinking_id)
+            except Exception:
+                pass
+
         try:
             chat_id = int(msg.chat_id)
         except ValueError:
@@ -442,8 +451,13 @@ class TelegramChannel(BaseChannel):
         self._chat_ids[sender_id] = chat_id
         str_chat_id = str(chat_id)
 
-        # Acknowledge receipt immediately — user sees typing before any processing
+        # Acknowledge receipt immediately — visible before any processing
         self._start_typing(str_chat_id)
+        try:
+            thinking = await self._app.bot.send_message(chat_id=chat_id, text="...")
+            self._thinking_msgs.setdefault(str_chat_id, []).append(thinking.message_id)
+        except Exception:
+            pass
 
         # Build content from text and/or media
         content_parts = []
@@ -490,14 +504,17 @@ class TelegramChannel(BaseChannel):
                 
                 # Handle voice transcription
                 if media_type == "voice" or media_type == "audio":
-                    from nanobot.providers.transcription import GroqTranscriptionProvider
-                    transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
-                    transcription = await transcriber.transcribe(file_path)
+                    transcription = await self._transcribe(file_path)
                     if transcription:
                         logger.info("Transcribed {}: {}...", media_type, transcription[:50])
-                        content_parts.append(f"[transcription: {transcription}]")
+                        content_parts.append(f"[voice message: {transcription}]")
                     else:
-                        content_parts.append(f"[{media_type}: {file_path}]")
+                        content_parts.append("[voice message received — transcription unavailable]")
+                elif media_type == "image":
+                    # Image is base64-encoded and sent to the LLM via media_paths.
+                    # Only add text if there's no caption (caption is already in content_parts).
+                    if not message.caption:
+                        content_parts.append("[photo]")
                 else:
                     content_parts.append(f"[{media_type}: {file_path}]")
                     
@@ -590,6 +607,20 @@ class TelegramChannel(BaseChannel):
     async def _on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Log polling / handler errors instead of silently swallowing them."""
         logger.error("Telegram error: {}", context.error)
+
+    async def _transcribe(self, file_path: Path) -> str:
+        """Try Groq transcription first; fall back to local Whisper if Groq key absent."""
+        from nanobot.providers.transcription import GroqTranscriptionProvider, LocalWhisperProvider
+
+        if self.groq_api_key:
+            result = await GroqTranscriptionProvider(api_key=self.groq_api_key).transcribe(file_path)
+            if result:
+                return result
+            logger.warning("Groq transcription returned empty, falling back to local whisper")
+
+        # Local Whisper fallback (tiny model, CPU, ~1-3s warm)
+        result = await LocalWhisperProvider().transcribe(file_path)
+        return result
 
     def _get_extension(self, media_type: str, mime_type: str | None) -> str:
         """Get file extension based on media type."""

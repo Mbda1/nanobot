@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator
@@ -216,7 +217,7 @@ async def write_audit(issue: dict, result: str, workspace: Path) -> None:
     description = issue.get("description", "(no description)")
     fix_type = issue.get("fix_type", "none")
 
-    ok = result.startswith(("gateway", "config", "patched", "wrote", "no fix"))
+    ok = result.startswith(("gateway", "config", "patched", "wrote", "no fix", "suggestion"))
     result_icon = "✅" if ok else "❌"
 
     entry = (
@@ -229,6 +230,53 @@ async def write_audit(issue: dict, result: str, workspace: Path) -> None:
 
     with open(log_path, "a", encoding="utf-8") as fh:
         fh.write(entry)
+
+
+async def write_suggestions(issues: list[dict], workspace: Path) -> None:
+    """Save 'suggest' fixes to a JSON file for the agent to read."""
+    suggestions_path = workspace / "memory" / "SUPERVISOR_SUGGESTIONS.json"
+    suggestions_path.parent.mkdir(parents=True, exist_ok=True)
+
+    current = []
+    if suggestions_path.exists():
+        try:
+            with open(suggestions_path, encoding="utf-8") as fh:
+                current = json.load(fh)
+        except Exception:
+            pass
+
+    for issue in issues:
+        if issue.get("fix_type") == "suggest":
+            issue["id"] = str(uuid.uuid4())[:8]
+            issue["timestamp"] = datetime.now().isoformat()
+            current.append(issue)
+
+    # Keep only last 10 suggestions to avoid bloat
+    current = current[-10:]
+
+    with open(suggestions_path, "w", encoding="utf-8") as fh:
+        json.dump(current, fh, indent=2)
+
+
+async def clear_suggestion(suggestion_id: str, workspace: Path) -> bool:
+    """Remove a suggestion from the JSON file by ID."""
+    suggestions_path = workspace / "memory" / "SUPERVISOR_SUGGESTIONS.json"
+    if not suggestions_path.exists():
+        return False
+
+    try:
+        with open(suggestions_path, encoding="utf-8") as fh:
+            current = json.load(fh)
+        
+        filtered = [s for s in current if s.get("id") != suggestion_id]
+        if len(filtered) == len(current):
+            return False
+
+        with open(suggestions_path, "w", encoding="utf-8") as fh:
+            json.dump(filtered, fh, indent=2)
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +349,8 @@ async def watch_gateway(config, poll_interval: int = 30) -> None:
 
     while True:
         await asyncio.sleep(poll_interval)
+        from nanobot.utils.tracing import set_trace_id
+        set_trace_id("watch")
         running = _gateway_running()
 
         if was_running and not running:
@@ -353,18 +403,36 @@ async def run_supervisor(config, verbose: bool = False) -> None:
 
         if len(buffer) >= 20 or elapsed >= 30:
             if buffer:
+                from nanobot.utils.tracing import set_trace_id
+                set_trace_id("sup-" + str(uuid.uuid4())[:4])
+                
                 issues = await detect_issues(buffer)
+                if issues:
+                    await write_suggestions(issues, workspace)
+                
                 for issue in issues:
                     fix_type = issue.get("fix_type", "none")
                     if fix_type == "none":
                         continue
+                    
                     result = await apply_fix(issue, config, workspace)
                     await write_audit(issue, result, workspace)
-                    # Notify Telegram only for critical issues or auto-applied fixes.
-                    # Suggestions and warnings from normal operations (heartbeat,
-                    # memory consolidation, write_file, etc.) are logged locally only.
-                    if issue.get("severity") == "critical" or fix_type not in ("suggest", "none"):
-                        await notify_telegram(issue, result, config)
+                    
+                    # Notify Telegram only for critical issues, auto-applied fixes, or new suggestions.
+                    if issue.get("severity") == "critical" or fix_type != "none":
+                        if fix_type == "suggest":
+                            # Use the ID we just assigned in write_suggestions
+                            text = (
+                                f"🤖 *NanoSupervisor Suggestion*\n"
+                                f"*Severity*: {issue.get('severity', 'info')}\n"
+                                f"*Issue*: {issue.get('description', '(no description)')}\n"
+                                f"*Recommendation*: {issue.get('fix_details', {}).get('suggestion', 'no details')}\n"
+                                f"\n*Status*: Logged and available for conversational resolution."
+                            )
+                            await send_event(text, config)
+                        else:
+                            await notify_telegram(issue, result, config)
+                    
                     logger.info(
                         f"[supervisor] {issue.get('severity', 'info').upper()} — "
                         f"{issue.get('description')} — {result}"

@@ -112,7 +112,7 @@ def test_trim_hot_idempotent(tmp_path):
 # get_memory_context — warm-tier loading
 # ---------------------------------------------------------------------------
 
-def test_warm_loading_keyword_match(tmp_path):
+async def test_warm_loading_keyword_match(tmp_path):
     """A topic file is injected when the user message contains a matching keyword."""
     store = _store(tmp_path)
     store.memory_file.write_text("## Recent\n- Some recent fact\n", encoding="utf-8")
@@ -120,12 +120,12 @@ def test_warm_loading_keyword_match(tmp_path):
     store.topics_dir.mkdir(parents=True, exist_ok=True)
     (store.topics_dir / "garage.md").write_text("## Garage\n- LS swap in progress\n", encoding="utf-8")
 
-    ctx = store.get_memory_context("what parts are in my garage")
+    ctx = await store.get_memory_context("what parts are in my garage")
     assert "LS swap" in ctx
     assert "Recalled Memory" in ctx
 
 
-def test_warm_loading_no_false_positive(tmp_path):
+async def test_warm_loading_no_false_positive(tmp_path):
     """An unrelated user message does not load topic files."""
     store = _store(tmp_path)
     store.memory_file.write_text("## Recent\n- fact\n", encoding="utf-8")
@@ -133,42 +133,93 @@ def test_warm_loading_no_false_positive(tmp_path):
     store.topics_dir.mkdir(parents=True, exist_ok=True)
     (store.topics_dir / "garage.md").write_text("## Garage\n- LS swap\n", encoding="utf-8")
 
-    ctx = store.get_memory_context("hello how are you today")
+    ctx = await store.get_memory_context("hello how are you today")
     assert "LS swap" not in ctx
     assert "Recalled Memory" not in ctx
 
 
-def test_warm_loading_empty_message(tmp_path):
+async def test_warm_loading_empty_message(tmp_path):
     """Empty user message never triggers warm loading."""
     store = _store(tmp_path)
     store.topics_dir.mkdir(parents=True, exist_ok=True)
     (store.topics_dir / "garage.md").write_text("## Garage\n- LS swap\n", encoding="utf-8")
 
-    ctx = store.get_memory_context("")
+    ctx = await store.get_memory_context("")
     assert "LS swap" not in ctx
 
 
-def test_warm_loading_no_topics_dir(tmp_path):
+async def test_warm_loading_no_topics_dir(tmp_path):
     """get_memory_context works fine when topics/ directory doesn't exist."""
     store = _store(tmp_path)
     store.memory_file.write_text("## Recent\n- fact\n", encoding="utf-8")
 
-    ctx = store.get_memory_context("garage parts")
+    ctx = await store.get_memory_context("garage parts")
     assert "Recent" in ctx  # hot tier still loads
     assert "Recalled Memory" not in ctx
 
 
-def test_hot_tier_always_present(tmp_path):
+async def test_hot_tier_always_present(tmp_path):
     """Hot tier content is always included regardless of user message."""
     store = _store(tmp_path)
     store.memory_file.write_text("## Core\n- user is Merim\n", encoding="utf-8")
 
-    ctx = store.get_memory_context("completely unrelated topic xyz")
+    ctx = await store.get_memory_context("completely unrelated topic xyz")
     assert "user is Merim" in ctx
 
 
-def test_get_memory_context_empty_when_no_files(tmp_path):
+async def test_get_memory_context_empty_when_no_files(tmp_path):
     """Returns empty string when MEMORY.md doesn't exist and no topics."""
     store = _store(tmp_path)
-    ctx = store.get_memory_context("any message")
+    ctx = await store.get_memory_context("any message")
     assert ctx == ""
+
+
+async def test_warm_loading_content_match(tmp_path):
+    """A topic file is loaded when the user message matches words in file content (not stem)."""
+    store = _store(tmp_path)
+    store.memory_file.write_text("## Recent\n- fact\n", encoding="utf-8")
+
+    store.topics_dir.mkdir(parents=True, exist_ok=True)
+    # Stem "builds" has no overlap with "xylophone"; content does
+    (store.topics_dir / "builds.md").write_text(
+        "## Build Notes\n- xylophone project ongoing\n", encoding="utf-8"
+    )
+
+    ctx = await store.get_memory_context("what about xylophone")
+    assert "xylophone" in ctx
+    assert "Recalled Memory" in ctx
+
+
+async def test_warm_loading_top_k_limit(tmp_path):
+    """Only top_k=3 (default) topic files are returned even when more match."""
+    store = _store(tmp_path)
+    store.topics_dir.mkdir(parents=True, exist_ok=True)
+
+    for i in range(5):
+        (store.topics_dir / f"topic-{i}.md").write_text(
+            f"## Topic {i}\n- rust programming notes {i}\n", encoding="utf-8"
+        )
+
+    ctx = await store.get_memory_context("rust programming")
+    # At most 3 topic blocks should appear
+    assert ctx.count("### topic-") <= 3
+
+
+@pytest.mark.llm
+async def test_warm_loading_semantic_synonym(tmp_path, embed_model_available):
+    """Semantic search matches synonym queries that keyword search would miss.
+
+    'automobile project' has no keyword overlap with 'LS engine swap' or 'vehicle',
+    but the embeddings should place them close enough (sim >= 0.25) to match.
+    """
+    store = _store(tmp_path)
+    store.memory_file.write_text("## Recent\n- some fact\n", encoding="utf-8")
+
+    store.topics_dir.mkdir(parents=True, exist_ok=True)
+    (store.topics_dir / "vehicle.md").write_text(
+        "## Vehicle\n- LS engine swap in progress\n", encoding="utf-8"
+    )
+
+    ctx = await store.get_memory_context("tell me about the automobile project")
+    assert "LS engine" in ctx
+    assert "Recalled Memory" in ctx
