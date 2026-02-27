@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import json
 import os
 import signal
 import subprocess
 import time
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator
@@ -16,6 +16,21 @@ from typing import AsyncIterator
 from loguru import logger
 
 from nanobot.config.constants import JUDGE_MODEL_DEFAULT, LOCAL_API_BASE
+
+
+# ---------------------------------------------------------------------------
+# Restart policy guards
+# ---------------------------------------------------------------------------
+
+# Avoid restart storms: require repeated timeout-like criticals before auto-restart.
+_TIMEOUT_ESCALATION_WINDOW_S = 10 * 60
+_TIMEOUT_ESCALATION_THRESHOLD = 3
+
+# Global cooldown between automatic restart attempts.
+_RESTART_COOLDOWN_S = 3 * 60
+
+_timeout_critical_events: deque[float] = deque()
+_last_restart_at: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +137,8 @@ async def detect_issues(lines: list[str]) -> list[dict]:
 
 async def apply_fix(issue: dict, config, workspace: Path) -> str:
     """Execute the fix described in *issue* and return a human-readable result string."""
+    global _last_restart_at
+
     fix_type = issue.get("fix_type", "none")
     details = issue.get("fix_details", {}) or {}
 
@@ -135,6 +152,29 @@ async def apply_fix(issue: dict, config, workspace: Path) -> str:
 
     try:
         if fix_type == "restart_gateway":
+            now = time.monotonic()
+
+            # Enforce cooldown for all restart attempts.
+            if now - _last_restart_at < _RESTART_COOLDOWN_S:
+                remain = int(_RESTART_COOLDOWN_S - (now - _last_restart_at))
+                return f"restart skipped: cooldown active ({remain}s remaining)"
+
+            # Timeout-like failures are usually transient; require repeated events
+            # in a time window before escalating to restart.
+            if _is_timeout_like_issue(issue):
+                _timeout_critical_events.append(now)
+                while _timeout_critical_events and (
+                    now - _timeout_critical_events[0] > _TIMEOUT_ESCALATION_WINDOW_S
+                ):
+                    _timeout_critical_events.popleft()
+
+                if len(_timeout_critical_events) < _TIMEOUT_ESCALATION_THRESHOLD:
+                    return (
+                        "restart skipped: timeout-like issue below escalation threshold "
+                        f"({len(_timeout_critical_events)}/{_TIMEOUT_ESCALATION_THRESHOLD} "
+                        f"in {_TIMEOUT_ESCALATION_WINDOW_S}s)"
+                    )
+
             return await _restart_gateway()
 
         return "no fix applied"
@@ -147,15 +187,13 @@ async def apply_fix(issue: dict, config, workspace: Path) -> str:
 
 async def _restart_gateway() -> str:
     """Kill the running gateway process and start a fresh one."""
+    global _last_restart_at
+
     # Send SIGTERM to any process with 'nanobot gateway' in its command line
     killed = False
+    pids: list[str] = []
     try:
-        result = subprocess.run(
-            ["pgrep", "-f", "nanobot gateway"],
-            capture_output=True,
-            text=True,
-        )
-        pids = [p.strip() for p in result.stdout.splitlines() if p.strip()]
+        pids = [str(p) for p in _gateway_pids()]
         for pid in pids:
             try:
                 os.kill(int(pid), signal.SIGTERM)
@@ -191,12 +229,22 @@ async def _restart_gateway() -> str:
 
     # Spawn a new gateway (detached)
     try:
+        # If one survived shutdown, do not spawn another copy.
+        alive = _gateway_pids()
+        if alive:
+            _ensure_single_gateway_instance()
+            _last_restart_at = time.monotonic()
+            return f"restart skipped: gateway still running (pids={alive})"
+
         subprocess.Popen(
             ["nanobot", "gateway"],
             start_new_session=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        await asyncio.sleep(1.0)
+        _ensure_single_gateway_instance()
+        _last_restart_at = time.monotonic()
         return f"gateway {'restarted' if killed else 'started'}"
     except FileNotFoundError:
         return "restart failed: nanobot not found in PATH"
@@ -217,7 +265,7 @@ async def write_audit(issue: dict, result: str, workspace: Path) -> None:
     description = issue.get("description", "(no description)")
     fix_type = issue.get("fix_type", "none")
 
-    ok = result.startswith(("gateway", "config", "patched", "wrote", "no fix", "suggestion"))
+    ok = result.startswith(("gateway", "config", "patched", "wrote", "no fix"))
     result_icon = "✅" if ok else "❌"
 
     entry = (
@@ -230,53 +278,6 @@ async def write_audit(issue: dict, result: str, workspace: Path) -> None:
 
     with open(log_path, "a", encoding="utf-8") as fh:
         fh.write(entry)
-
-
-async def write_suggestions(issues: list[dict], workspace: Path) -> None:
-    """Save 'suggest' fixes to a JSON file for the agent to read."""
-    suggestions_path = workspace / "memory" / "SUPERVISOR_SUGGESTIONS.json"
-    suggestions_path.parent.mkdir(parents=True, exist_ok=True)
-
-    current = []
-    if suggestions_path.exists():
-        try:
-            with open(suggestions_path, encoding="utf-8") as fh:
-                current = json.load(fh)
-        except Exception:
-            pass
-
-    for issue in issues:
-        if issue.get("fix_type") == "suggest":
-            issue["id"] = str(uuid.uuid4())[:8]
-            issue["timestamp"] = datetime.now().isoformat()
-            current.append(issue)
-
-    # Keep only last 10 suggestions to avoid bloat
-    current = current[-10:]
-
-    with open(suggestions_path, "w", encoding="utf-8") as fh:
-        json.dump(current, fh, indent=2)
-
-
-async def clear_suggestion(suggestion_id: str, workspace: Path) -> bool:
-    """Remove a suggestion from the JSON file by ID."""
-    suggestions_path = workspace / "memory" / "SUPERVISOR_SUGGESTIONS.json"
-    if not suggestions_path.exists():
-        return False
-
-    try:
-        with open(suggestions_path, encoding="utf-8") as fh:
-            current = json.load(fh)
-        
-        filtered = [s for s in current if s.get("id") != suggestion_id]
-        if len(filtered) == len(current):
-            return False
-
-        with open(suggestions_path, "w", encoding="utf-8") as fh:
-            json.dump(filtered, fh, indent=2)
-        return True
-    except Exception:
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -332,15 +333,58 @@ async def notify_telegram(issue: dict, result: str, config) -> None:
 
 def _gateway_running() -> bool:
     """Return True if a 'nanobot gateway' process is currently running."""
+    return bool(_gateway_pids())
+
+
+def _gateway_pids() -> list[int]:
+    """Return all running 'nanobot gateway' PIDs."""
     try:
         result = subprocess.run(
             ["pgrep", "-f", "nanobot gateway"],
             capture_output=True,
             text=True,
         )
-        return bool(result.stdout.strip())
+        out = []
+        for raw in result.stdout.splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                out.append(int(raw))
+            except ValueError:
+                continue
+        return out
     except FileNotFoundError:
-        return False
+        return []
+
+
+def _ensure_single_gateway_instance() -> list[int]:
+    """Best-effort dedupe to one gateway process, keeping newest PID."""
+    pids = _gateway_pids()
+    uniq = sorted(set(pids))
+    if len(uniq) <= 1:
+        return uniq
+
+    keep = max(uniq)
+    for pid in uniq:
+        if pid == keep:
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    logger.warning("[supervisor] deduped gateway instances: kept {}, terminated {}", keep, [p for p in uniq if p != keep])
+    return _gateway_pids()
+
+
+def _is_timeout_like_issue(issue: dict) -> bool:
+    """Return True if issue text indicates a timeout/transient slowness pattern."""
+    desc = str(issue.get("description", "")).lower()
+    details = issue.get("fix_details", {}) or {}
+    suggestion = str(details.get("suggestion", "")).lower()
+    text = f"{desc}\n{suggestion}"
+    markers = ("readtimeout", "request timed out", "timeout", "timed out")
+    return any(m in text for m in markers)
 
 
 async def watch_gateway(config, poll_interval: int = 30) -> None:
@@ -349,8 +393,7 @@ async def watch_gateway(config, poll_interval: int = 30) -> None:
 
     while True:
         await asyncio.sleep(poll_interval)
-        from nanobot.utils.tracing import set_trace_id
-        set_trace_id("watch")
+        _ensure_single_gateway_instance()
         running = _gateway_running()
 
         if was_running and not running:
@@ -403,36 +446,18 @@ async def run_supervisor(config, verbose: bool = False) -> None:
 
         if len(buffer) >= 20 or elapsed >= 30:
             if buffer:
-                from nanobot.utils.tracing import set_trace_id
-                set_trace_id("sup-" + str(uuid.uuid4())[:4])
-                
                 issues = await detect_issues(buffer)
-                if issues:
-                    await write_suggestions(issues, workspace)
-                
                 for issue in issues:
                     fix_type = issue.get("fix_type", "none")
                     if fix_type == "none":
                         continue
-                    
                     result = await apply_fix(issue, config, workspace)
                     await write_audit(issue, result, workspace)
-                    
-                    # Notify Telegram only for critical issues, auto-applied fixes, or new suggestions.
-                    if issue.get("severity") == "critical" or fix_type != "none":
-                        if fix_type == "suggest":
-                            # Use the ID we just assigned in write_suggestions
-                            text = (
-                                f"🤖 *NanoSupervisor Suggestion*\n"
-                                f"*Severity*: {issue.get('severity', 'info')}\n"
-                                f"*Issue*: {issue.get('description', '(no description)')}\n"
-                                f"*Recommendation*: {issue.get('fix_details', {}).get('suggestion', 'no details')}\n"
-                                f"\n*Status*: Logged and available for conversational resolution."
-                            )
-                            await send_event(text, config)
-                        else:
-                            await notify_telegram(issue, result, config)
-                    
+                    # Notify Telegram only for critical issues or auto-applied fixes.
+                    # Suggestions and warnings from normal operations (heartbeat,
+                    # memory consolidation, write_file, etc.) are logged locally only.
+                    if issue.get("severity") == "critical" or fix_type not in ("suggest", "none"):
+                        await notify_telegram(issue, result, config)
                     logger.info(
                         f"[supervisor] {issue.get('severity', 'info').upper()} — "
                         f"{issue.get('description')} — {result}"
