@@ -234,6 +234,7 @@ class HeartbeatConfig(Base):
 
     enabled: bool = True
     interval_s: int = 30 * 60  # 30 minutes
+    model: str | None = None  # Optional dedicated model for heartbeat decisions
 
 
 class GatewayConfig(Base):

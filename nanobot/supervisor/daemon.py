@@ -154,6 +154,12 @@ async def apply_fix(issue: dict, config, workspace: Path) -> str:
         if fix_type == "restart_gateway":
             now = time.monotonic()
 
+            # Autonomous restart is reserved for gateway-health failures only.
+            # Local-model faults and generic message-processing errors should
+            # not bounce an otherwise running gateway.
+            if not _is_gateway_health_issue(issue):
+                return "restart skipped: issue is not gateway-health critical"
+
             # Enforce cooldown for all restart attempts.
             if now - _last_restart_at < _RESTART_COOLDOWN_S:
                 remain = int(_RESTART_COOLDOWN_S - (now - _last_restart_at))
@@ -209,7 +215,7 @@ async def _restart_gateway() -> str:
         for _ in range(deadline * 5):
             await asyncio.sleep(0.2)
             check = subprocess.run(
-                ["pgrep", "-f", "nanobot gateway"],
+                ["pgrep", "-f", "/nanobot gateway"],
                 capture_output=True, text=True,
             )
             still_alive = [p for p in check.stdout.splitlines()
@@ -340,7 +346,7 @@ def _gateway_pids() -> list[int]:
     """Return all running 'nanobot gateway' PIDs."""
     try:
         result = subprocess.run(
-            ["pgrep", "-f", "nanobot gateway"],
+            ["pgrep", "-f", "/nanobot gateway"],
             capture_output=True,
             text=True,
         )
@@ -384,6 +390,24 @@ def _is_timeout_like_issue(issue: dict) -> bool:
     suggestion = str(details.get("suggestion", "")).lower()
     text = f"{desc}\n{suggestion}"
     markers = ("readtimeout", "request timed out", "timeout", "timed out")
+    return any(m in text for m in markers)
+
+
+def _is_gateway_health_issue(issue: dict) -> bool:
+    """Return True only for issues that indicate gateway process health failure."""
+    desc = str(issue.get("description", "")).lower()
+    details = issue.get("fix_details", {}) or {}
+    suggestion = str(details.get("suggestion", "")).lower()
+    text = f"{desc}\n{suggestion}"
+    markers = (
+        "gateway crash",
+        "gateway crashed",
+        "gateway unresponsive",
+        "gateway process gone",
+        "gateway not running",
+        "process unresponsive",
+        "telegram gateway unresponsive",
+    )
     return any(m in text for m in markers)
 
 

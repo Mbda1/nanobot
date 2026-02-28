@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
@@ -82,6 +83,33 @@ class HeartbeatService:
                 return None
         return None
 
+    @staticmethod
+    def _has_actionable_tasks(content: str) -> bool:
+        """Fast gate to avoid paid model calls when heartbeat file is effectively empty.
+
+        Treat plain headings/comments/whitespace as no-op. Trigger only when there
+        are explicit task markers.
+        """
+        if not content.strip():
+            return False
+        markers = (
+            r"^\s*[-*]\s+\[[ xX]\]",  # markdown checkbox tasks
+            r"^\s*[-*]\s+TODO\b",     # bullet todo
+            r"^\s*TODO\s*:",          # inline TODO:
+            r"^\s*Task\s*:",          # Task:
+        )
+        for line in content.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("#"):
+                continue
+            if s.startswith(">"):
+                continue
+            if any(re.search(p, s) for p in markers):
+                return True
+        return False
+
     async def _decide(self, content: str) -> tuple[str, str]:
         """Phase 1: ask LLM to decide skip/run via virtual tool call.
 
@@ -142,6 +170,10 @@ class HeartbeatService:
         content = self._read_heartbeat_file()
         if not content:
             logger.debug("Heartbeat: HEARTBEAT.md missing or empty")
+            return
+
+        if not self._has_actionable_tasks(content):
+            logger.info("Heartbeat: no actionable tasks in HEARTBEAT.md (skipping model call)")
             return
 
         logger.info("Heartbeat: checking for tasks...")

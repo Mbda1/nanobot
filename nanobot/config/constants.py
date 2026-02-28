@@ -8,13 +8,16 @@ Quick reference:
   Change memory tuning → MEMORY_CHUNK_SIZE / MEMORY_WINDOW_DEFAULT
   Change timeouts      → TIMEOUT_* values
 """
+import os
 
 # --- Models ---
 CLOUD_MODEL_DEFAULT  = "openrouter/anthropic/claude-haiku-4-5"
-LOCAL_MODEL_DEFAULT  = "ollama/qwen2.5:7b"    # enrichment + memory (fast, ~27 tok/s)
-JUDGE_MODEL_DEFAULT  = "ollama/mistral-nemo"  # eval judge + supervisor (quality, ~16 tok/s)
+LOCAL_MODEL_DEFAULT  = "qwen2.5-3b"    # enrichment + memory on llama.cpp
+JUDGE_MODEL_DEFAULT  = "qwen2.5-3b"    # eval judge + supervisor on local llama.cpp
 EMBED_MODEL_DEFAULT  = "nomic-embed-text"     # semantic warm-tier search (274 MB, 768-dim)
-LOCAL_API_BASE       = "http://host.docker.internal:11434"
+LOCAL_API_BASE       = os.getenv("NB_LOCAL_API_BASE", "http://127.0.0.1:8080").strip()
+LOCAL_LLM_BACKEND    = os.getenv("NB_LOCAL_LLM_BACKEND", "openai").strip().lower()
+LOCAL_API_KEY        = os.getenv("NB_LOCAL_API_KEY", "").strip()
 
 # --- Agent limits ---
 MAX_TOKENS_DEFAULT    = 4096
@@ -34,7 +37,7 @@ TIMEOUT_EMBED         =  5.0   # semantic embedding        (embeddings.py) — f
 TIMEOUT_CHUNK_SUMMARY = 20.0   # chunk summarization       (memory.py) — cloud, fast
 TIMEOUT_MEMORY_CONSOLIDATION = 60.0   # total consolidation budget per run
 TIMEOUT_WEB_FETCH     = 30.0   # HTTP fetch                (tools/web.py)
-TIMEOUT_JUDGE         = 60.0   # LLM-as-judge eval         (eval.py) — Nemo 12B needs headroom on cold start
+TIMEOUT_JUDGE         = 60.0   # LLM-as-judge eval         (eval.py) — keep headroom for local cold starts
 
 # --- Ollama keep-alive ---
 # -1 = keep model loaded in RAM indefinitely (never unload on idle)
@@ -51,7 +54,7 @@ TOOL_RESULT_MAX_CHARS = 500    # tool output truncation    (loop.py)
 MEMORY_HOT_MAX_LINES   = 200
 SIMILARITY_THRESHOLD   = 0.50  # minimum cosine similarity to load a warm-tier topic
 MEMORY_FLUSH_THRESHOLD = 18    # soft flush to MEMORY.md before window slides (< MEMORY_WINDOW_DEFAULT)
-TIMEOUT_FLUSH = 30.0           # local-LLM flush timeout (qwen2.5:7b, pinned in RAM)
+TIMEOUT_FLUSH = 30.0           # local-LLM flush timeout (qwen2.5-3b on llama.cpp)
 
 # --- Supervisor / delegation ---
 DELEGATE_MAX_ITERATIONS = 15   # max LLM iterations per delegated worker

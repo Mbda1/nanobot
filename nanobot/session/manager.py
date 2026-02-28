@@ -53,8 +53,21 @@ class Session:
                 sliced = sliced[i:]
                 break
 
-        out: list[dict[str, Any]] = []
+        # Defensive normalization for legacy/corrupted histories:
+        # - Collapse consecutive user messages to the latest one only
+        # - Skip orphan tool messages that are not preceded by an assistant turn
+        normalized: list[dict[str, Any]] = []
         for m in sliced:
+            role = m.get("role")
+            if role == "user" and normalized and normalized[-1].get("role") == "user":
+                normalized[-1] = m
+                continue
+            if role == "tool" and (not normalized or normalized[-1].get("role") != "assistant"):
+                continue
+            normalized.append(m)
+
+        out: list[dict[str, Any]] = []
+        for m in normalized:
             entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}
             for k in ("tool_calls", "tool_call_id", "name"):
                 if k in m:

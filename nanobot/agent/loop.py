@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -15,11 +14,10 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.enrichment import enrich_query
 from nanobot.agent.memory import MemoryStore
-from nanobot.agent.usage import init as _usage_init, record as _usage_record, record_metric as _record_metric
+from nanobot.agent.usage import init as _usage_init, record as _usage_record
 from nanobot.config.constants import (
     CIRCUIT_BREAKER_CONSECUTIVE,
     CIRCUIT_BREAKER_PER_TOOL,
-    MEMORY_FLUSH_THRESHOLD,
     TOOL_RESULT_MAX_CHARS,
 )
 from nanobot.agent.subagent import SubagentManager
@@ -29,7 +27,6 @@ from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
-from nanobot.agent.tools.supervisor import SupervisorTool
 from nanobot.agent.tools.browser import WebBrowseTool
 from nanobot.agent.tools.delegate import DelegateTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
@@ -114,8 +111,6 @@ class AgentLoop:
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: dict[str, asyncio.Lock] = {}
-        self._flushing: set[str] = set()              # Session keys with flush in progress
-        self._flush_hwm: dict[str, int] = {}          # session_key → message count at last flush
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -131,7 +126,6 @@ class AgentLoop:
         self.tools.register(WebSearchTool(api_key=self.brave_api_key))
         self.tools.register(WebFetchTool())
         self.tools.register(WebBrowseTool())
-        self.tools.register(SupervisorTool(workspace=self.workspace))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
         self.tools.register(DelegateTool(manager=self.subagents))
@@ -190,6 +184,25 @@ class AgentLoop:
                 return tc.name
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
+
+    @staticmethod
+    def _phase_from_tool_hint(hint: str) -> str | None:
+        """Map a tool hint string to a coarse progress phase."""
+        m = re.match(r"\s*([a-zA-Z_][a-zA-Z0-9_]*)\(", hint or "")
+        if not m:
+            return None
+        tool = m.group(1).lower()
+        if tool in {"delegate", "spawn"}:
+            return "researching in parallel"
+        if tool in {"web_search", "web_fetch", "web_browse"}:
+            return "gathering sources"
+        if tool in {"read_file", "list_dir"}:
+            return "reviewing files"
+        if tool in {"write_file", "edit_file"}:
+            return "writing draft"
+        if tool == "exec":
+            return "running checks"
+        return None
 
     async def _run_agent_loop(
         self,
@@ -303,8 +316,10 @@ class AgentLoop:
                     )
             else:
                 final_content = self._strip_think(response.content)
+                # Persist assistant text-only replies into session history.
                 messages = self.context.add_assistant_message(
-                    messages, final_content,
+                    messages,
+                    final_content,
                     reasoning_content=response.reasoning_content,
                 )
                 break
@@ -324,7 +339,6 @@ class AgentLoop:
         await self._connect_mcp()
         if self.local_model:
             await self._warmup_local_model()  # await: ensure model is in RAM before first message
-        await self._warmup_embed_model()  # pin nomic-embed-text in RAM for warm search
         logger.info("Agent loop started")
 
         while self._running:
@@ -384,9 +398,6 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
-        from nanobot.utils.tracing import set_trace_id
-        set_trace_id()
-
         # System messages: parse origin from chat_id ("channel:chat_id")
         if msg.channel == "system":
             channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
@@ -445,22 +456,32 @@ class AgentLoop:
                                   content="New session started.")
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/search <query> — Search conversation history\n/help — Show available commands")
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/help — Show available commands")
 
-        if msg.content.strip().lower().startswith("/search"):
-            query = msg.content.strip()[7:].strip()
-            if not query:
-                return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                      content="Usage: /search <query>\nExample: /search LS swap budget")
-            result = await self._search_sessions(query)
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=result)
+        unconsolidated = len(session.messages) - session.last_consolidated
+        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
+            self._consolidating.add(session.key)
+            lock = self._get_consolidation_lock(session.key)
+
+            async def _consolidate_and_unlock():
+                try:
+                    async with lock:
+                        await self._consolidate_memory(session)
+                finally:
+                    self._consolidating.discard(session.key)
+                    self._prune_consolidation_lock(session.key, lock)
+                    _task = asyncio.current_task()
+                    if _task is not None:
+                        self._consolidation_tasks.discard(_task)
+
+            _task = asyncio.create_task(_consolidate_and_unlock())
+            self._consolidation_tasks.add(_task)
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
-        _turn_start = time.monotonic()
         history = session.get_history(max_messages=self.memory_window)
         enriched_content = await enrich_query(self.provider, self.local_model, msg.content)
         initial_messages = await self.context.build_messages(
@@ -470,17 +491,82 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id,
         )
 
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+        progress_state = {
+            "started_at": asyncio.get_running_loop().time(),
+            "last_sent_at": 0.0,
+            "sent_count": 0,
+            "phases": set(),
+        }
+        progress_lock = asyncio.Lock()
+        progress_task: asyncio.Task | None = None
+        progress_enabled = msg.channel != "cli"
+        progress_start_delay_s = 20.0
+        progress_interval_s = 45.0
+        progress_max_messages = 5
+
+        async def _emit_progress(text: str, *, tool_hint: bool = False) -> None:
+            if not progress_enabled:
+                return
+            async with progress_lock:
+                if progress_state["sent_count"] >= progress_max_messages:
+                    return
+                progress_state["last_sent_at"] = asyncio.get_running_loop().time()
+                progress_state["sent_count"] += 1
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
             await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
+                channel=msg.channel, chat_id=msg.chat_id, content=text, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
-        )
+        async def _heartbeat_loop() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(progress_interval_s)
+                    now = asyncio.get_running_loop().time()
+                    elapsed = now - progress_state["started_at"]
+                    if elapsed < progress_start_delay_s:
+                        continue
+                    if (now - progress_state["last_sent_at"]) < progress_interval_s:
+                        continue
+                    await _emit_progress(
+                        "Still working on this. I will send the final answer as soon as it's ready."
+                    )
+            except asyncio.CancelledError:
+                return
+
+        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+            if not progress_enabled:
+                return
+            if not tool_hint:
+                return
+            now = asyncio.get_running_loop().time()
+            elapsed = now - progress_state["started_at"]
+            phase = self._phase_from_tool_hint(content)
+            if phase and phase not in progress_state["phases"] and elapsed >= progress_start_delay_s:
+                progress_state["phases"].add(phase)
+                await _emit_progress(f"Progress: {phase}.")
+                return
+            if elapsed >= progress_start_delay_s and (now - progress_state["last_sent_at"]) >= progress_interval_s:
+                await _emit_progress(
+                    "Still working on this. I will send the final answer as soon as it's ready."
+                )
+
+        if progress_enabled:
+            await _emit_progress("Working on it now. This can take a few minutes for deep research.")
+            progress_task = asyncio.create_task(_heartbeat_loop())
+
+        try:
+            final_content, _, all_msgs = await self._run_agent_loop(
+                initial_messages, on_progress=on_progress or _bus_progress,
+            )
+        finally:
+            if progress_task:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -488,61 +574,8 @@ class AgentLoop:
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        _latency_ms = int((time.monotonic() - _turn_start) * 1000)
-        _record_metric("turn_latency", latency_ms=_latency_ms)
-
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
-
-        # Memory flush: fire once per consolidation cycle when approaching memory_window
-        unconsolidated_after = len(session.messages) - session.last_consolidated
-        flushed_at = self._flush_hwm.get(session.key, 0)
-        if (
-            unconsolidated_after >= MEMORY_FLUSH_THRESHOLD
-            and len(session.messages) > flushed_at
-            and session.key not in self._flushing
-            and session.key not in self._consolidating
-            and self.local_model
-        ):
-            self._flushing.add(session.key)
-            self._flush_hwm[session.key] = len(session.messages)
-            flush_msgs = list(session.messages[session.last_consolidated:])
-            _flush_session_key = session.key
-
-            async def _flush_and_unlock():
-                from nanobot.utils.tracing import set_trace_id
-                set_trace_id(f"flush-{_flush_session_key[:4]}")
-                try:
-                    await MemoryStore(self.workspace).flush_to_hot(flush_msgs, self.local_model)
-                except Exception as exc:
-                    logger.warning("Memory flush error: {}", exc)
-                finally:
-                    self._flushing.discard(_flush_session_key)
-
-            asyncio.create_task(_flush_and_unlock())
-
-        # Memory consolidation: scheduled AFTER response is sent so the main
-        # Ollama request is never queued behind consolidation's chunk calls.
-        if (unconsolidated_after >= self.memory_window and session.key not in self._consolidating):
-            self._consolidating.add(session.key)
-            lock = self._get_consolidation_lock(session.key)
-
-            async def _consolidate_and_unlock():
-                from nanobot.utils.tracing import set_trace_id
-                set_trace_id(f"mem-{session.key[:4]}")
-                try:
-                    async with lock:
-                        await self._consolidate_memory(session)
-                finally:
-                    self._consolidating.discard(session.key)
-                    self._flush_hwm.pop(session.key, None)   # allow fresh flush next cycle
-                    self._prune_consolidation_lock(session.key, lock)
-                    _ctask = asyncio.current_task()
-                    if _ctask is not None:
-                        self._consolidation_tasks.discard(_ctask)
-
-            _ctask = asyncio.create_task(_consolidate_and_unlock())
-            self._consolidation_tasks.add(_ctask)
 
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
@@ -568,75 +601,8 @@ class AgentLoop:
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
-    async def _search_sessions(self, query: str, top_k: int = 5) -> str:
-        """Keyword pre-filter + optional semantic re-rank across all session JSONL files."""
-        sessions_dir = self.workspace / "sessions"
-        query_words = set(query.lower().split())
-        candidates: list[tuple[int, dict, str]] = []
-
-        for session_file in sorted(sessions_dir.glob("*.jsonl")):
-            try:
-                with open(session_file, encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            msg = json.loads(line)
-                        except Exception:
-                            continue
-                        if msg.get("_type") == "metadata":
-                            continue
-                        role = msg.get("role", "")
-                        if role not in ("user", "assistant"):
-                            continue
-                        content = msg.get("content", "")
-                        if not content or not isinstance(content, str):
-                            continue
-                        content_lower = content.lower()
-                        score = sum(1 for w in query_words if w in content_lower)
-                        if score > 0:
-                            candidates.append((score, msg, session_file.stem))
-            except Exception:
-                continue
-
-        if not candidates:
-            return f"No messages found matching: **{query}**"
-
-        candidates.sort(key=lambda x: -x[0])
-        top_candidates = candidates[:20]
-
-        # Semantic re-rank if Ollama is up
-        from nanobot.agent.embeddings import cosine_similarity, ollama_embed
-        query_vec = await ollama_embed(query)
-        if query_vec:
-            semantic: list[tuple[float, dict, str]] = []
-            for _, msg, session in top_candidates:
-                vec = await ollama_embed(msg["content"][:500])
-                if vec:
-                    semantic.append((cosine_similarity(query_vec, vec), msg, session))
-            if semantic:
-                semantic.sort(key=lambda x: -x[0])
-                final: list[tuple[float, dict, str]] = semantic[:top_k]
-            else:
-                final = [(s / max(len(query_words), 1), m, sess) for s, m, sess in top_candidates[:top_k]]
-        else:
-            final = [(s / max(len(query_words), 1), m, sess) for s, m, sess in top_candidates[:top_k]]
-
-        lines = [f"🔍 **Search:** {query}\n"]
-        for sim, msg, _ in final:
-            ts = (msg.get("timestamp") or "")[:16].replace("T", " ")
-            role_label = "You" if msg.get("role") == "user" else "Bot"
-            snippet = msg["content"][:200].replace("\n", " ")
-            if len(msg["content"]) > 200:
-                snippet += "…"
-            lines.append(f"**{ts}** {role_label}: {snippet}")
-
-        return "\n".join(lines)
-
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
-        import asyncio
         from nanobot.config.constants import TIMEOUT_MEMORY_CONSOLIDATION
         try:
             return await asyncio.wait_for(
@@ -654,54 +620,51 @@ class AgentLoop:
             return False
 
     async def _warmup_local_model(self) -> None:
-        """Load the local model into Ollama RAM with keep_alive=-1 (never unload).
+        """Warm up local model on supported backends.
 
-        LiteLLM silently drops the keep_alive param, so we call the Ollama
-        /api/chat endpoint directly. keep_alive=-1 pins the model in RAM until
-        Ollama itself is restarted — eliminates cold-start timeouts entirely.
+        For Ollama we use keep_alive=-1 to pin model in RAM.
+        For OpenAI-compatible backends (e.g. llama.cpp), issue a tiny prompt
+        to prime model load without Ollama-only params.
         """
         if not self.local_model:
             return
         # Extract bare model name (e.g. "ollama/mistral" → "mistral")
         model_name = self.local_model.split("/")[-1]
-        from nanobot.config.constants import LOCAL_API_BASE
-        ollama_base = LOCAL_API_BASE.rstrip("/")
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                await client.post(
-                    f"{ollama_base}/api/chat",
-                    json={
-                        "model": model_name,
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "stream": False,
-                        "keep_alive": -1,
-                        "options": {"num_predict": 1},
-                    },
-                )
-            logger.info("Local model pinned in RAM: {} (keep_alive=-1)", model_name)
-        except Exception as exc:
-            logger.debug("Local model warmup skipped (Ollama may be offline): {}", exc)
-
-    async def _warmup_embed_model(self) -> None:
-        """Pin nomic-embed-text in Ollama RAM with keep_alive=-1.
-
-        Uses the /api/embed endpoint directly with a 120s timeout to absorb
-        cold-start latency (~43s on CPU). Subsequent embed calls use TIMEOUT_EMBED
-        (5s), which is safe once the model is in RAM.
-        """
-        from nanobot.config.constants import EMBED_MODEL_DEFAULT, LOCAL_API_BASE, OLLAMA_KEEP_ALIVE
-        url = LOCAL_API_BASE.rstrip("/") + "/api/embed"
+        from nanobot.config.constants import LOCAL_API_BASE, LOCAL_API_KEY, LOCAL_LLM_BACKEND
+        local_base = LOCAL_API_BASE.rstrip("/")
         try:
             import httpx
             async with httpx.AsyncClient(timeout=120.0) as client:
-                await client.post(
-                    url,
-                    json={"model": EMBED_MODEL_DEFAULT, "input": "warmup", "keep_alive": OLLAMA_KEEP_ALIVE},
-                )
-            logger.info("Embed model pinned in RAM: {} (keep_alive=-1)", EMBED_MODEL_DEFAULT)
+                if LOCAL_LLM_BACKEND in {"openai", "llamacpp", "llama.cpp"}:
+                    headers = {"Content-Type": "application/json"}
+                    if LOCAL_API_KEY:
+                        headers["Authorization"] = f"Bearer {LOCAL_API_KEY}"
+                    await client.post(
+                        f"{local_base}/v1/chat/completions",
+                        headers=headers,
+                        json={
+                            "model": model_name,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "max_tokens": 1,
+                            "temperature": 0.0,
+                            "stream": False,
+                        },
+                    )
+                    logger.info("Local model warmup complete: {} (backend={})", model_name, LOCAL_LLM_BACKEND)
+                else:
+                    await client.post(
+                        f"{local_base}/api/chat",
+                        json={
+                            "model": model_name,
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": False,
+                            "keep_alive": -1,
+                            "options": {"num_predict": 1},
+                        },
+                    )
+                    logger.info("Local model pinned in RAM: {} (keep_alive=-1)", model_name)
         except Exception as exc:
-            logger.debug("Embed model warmup skipped (Ollama may be offline): {}", exc)
+            logger.debug("Local model warmup skipped (backend={}): {}", LOCAL_LLM_BACKEND, exc)
 
     async def process_direct(
         self,
