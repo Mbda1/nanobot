@@ -17,7 +17,7 @@ from nanobot.agent.tools.base import Tool
 if TYPE_CHECKING:
     from nanobot.agent.subagent import SubagentManager
 
-_ROLES = ["researcher", "writer", "analyst", "coder", "general"]
+_ROLES = ["researcher", "writer", "analyst", "coder", "curator", "general"]
 
 
 class DelegateTool(Tool):
@@ -37,7 +37,8 @@ class DelegateTool(Tool):
         "Delegate a subtask to a specialized worker agent and get the result inline. "
         "Multiple delegate calls in one response run in parallel. "
         "Choose a role: researcher (web research), writer (prose/drafting), "
-        "analyst (data/comparisons), coder (code generation), general (default)."
+        "analyst (data/comparisons), coder (code generation), curator (Obsidian vault maintenance), "
+        "general (default)."
     )
     parameters = {
         "type": "object",

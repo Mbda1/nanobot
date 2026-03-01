@@ -8,9 +8,10 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.agent.context import ContextBuilder
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.config.constants import DELEGATE_MAX_ITERATIONS
+from nanobot.config.constants import DELEGATE_MAX_ITERATIONS, WEB_SEARCH_MAX_COUNT
 from nanobot.providers.base import LLMProvider
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
@@ -40,6 +41,11 @@ _ROLE_PROMPTS: dict[str, str] = {
     "coder": (
         "You are a coding specialist. Write clean, working code with minimal explanation. "
         "Prefer idiomatic style. Include error handling. Return runnable output."
+    ),
+    "curator": (
+        "You are an Obsidian vault curator specialist. Optimize note structure, links, frontmatter, "
+        "tags, and navigation with minimal disruption. Prefer safe incremental edits, preserve author "
+        "voice, and surface concise suggestions before large-scale refactors."
     ),
     "general": (
         "You are a focused task-completion agent. Complete the assigned task thoroughly "
@@ -125,7 +131,7 @@ class SubagentManager:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build_tools(self) -> ToolRegistry:
+    def _build_tools(self, role: str = "general") -> ToolRegistry:
         """Build the tool registry available to subagents."""
         tools = ToolRegistry()
         allowed_dir = self.workspace if self.restrict_to_workspace else None
@@ -138,9 +144,10 @@ class SubagentManager:
             timeout=self.exec_config.timeout,
             restrict_to_workspace=self.restrict_to_workspace,
         ))
-        tools.register(WebSearchTool(api_key=self.brave_api_key))
-        tools.register(WebFetchTool())
-        tools.register(WebBrowseTool())
+        if role != "curator":
+            tools.register(WebSearchTool(api_key=self.brave_api_key))
+            tools.register(WebFetchTool())
+            tools.register(WebBrowseTool())
         return tools
 
     def _build_system_prompt(self, role: str = "general") -> str:
@@ -177,7 +184,7 @@ When done, provide a clear, structured summary of your findings or actions."""
 
     async def _execute_subagent(self, task_id: str, task: str, role: str = "general") -> str:
         """Run the agent loop and return the final result string."""
-        tools = self._build_tools()
+        tools = self._build_tools(role=role)
         system_prompt = self._build_system_prompt(role)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
@@ -186,6 +193,7 @@ When done, provide a clear, structured summary of your findings or actions."""
 
         iteration = 0
         final_result: str | None = None
+        web_search_calls = 0
 
         while iteration < DELEGATE_MAX_ITERATIONS:
             iteration += 1
@@ -217,12 +225,30 @@ When done, provide a clear, structured summary of your findings or actions."""
                 })
 
                 for tool_call in response.tool_calls:
+                    args = dict(tool_call.arguments or {})
+                    if tool_call.name == "web_search":
+                        web_search_calls += 1
+                        if web_search_calls > 3:
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": tool_call.name,
+                                "content": "Error: web_search call limit reached for delegated worker (3 per turn).",
+                            })
+                            continue
+                        try:
+                            req_count = int(args.get("count", 3) or 3)
+                        except Exception:
+                            req_count = 3
+                        args["count"] = min(max(req_count, 1), min(4, WEB_SEARCH_MAX_COUNT))
+                        args.setdefault("provider", "auto")
                     logger.debug(
                         "Worker [{}] tool: {}({})",
                         task_id, tool_call.name,
-                        json.dumps(tool_call.arguments, ensure_ascii=False)[:120],
+                        json.dumps(args, ensure_ascii=False)[:120],
                     )
-                    result = await tools.execute(tool_call.name, tool_call.arguments)
+                    result = await tools.execute(tool_call.name, args)
+                    result = ContextBuilder._compact_tool_result(tool_call.name, result, research_mode="balanced")
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,

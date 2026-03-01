@@ -7,13 +7,16 @@ from datetime import datetime
 from pathlib import Path
 
 _log_path: Path | None = None
+_metrics_path: Path | None = None
 
 
 def init(workspace: Path) -> None:
     """Call once at startup with the workspace path."""
-    global _log_path
+    global _log_path, _metrics_path
     _log_path = workspace / "memory" / "USAGE.jsonl"
     _log_path.parent.mkdir(parents=True, exist_ok=True)
+    _metrics_path = workspace / "memory" / "METRICS.jsonl"
+    _metrics_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def record(model: str, usage: dict, source: str = "agent", latency_ms: int = 0) -> None:
@@ -31,3 +34,18 @@ def record(model: str, usage: dict, source: str = "agent", latency_ms: int = 0) 
     }
     with open(_log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
+
+
+def metric(event: str, **fields) -> None:
+    """Append a lightweight metrics event to METRICS.jsonl."""
+    if not _metrics_path:
+        return
+    entry = {"ts": datetime.now().isoformat(timespec="seconds"), "event": event}
+    entry.update(fields)
+    with open(_metrics_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def record_metric(event: str, **fields) -> None:
+    """Backward-compatible alias used by existing callers."""
+    metric(event, **fields)

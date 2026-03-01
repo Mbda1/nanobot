@@ -13,11 +13,19 @@ import os
 
 # --- Models ---
 CLOUD_MODEL_DEFAULT = "openrouter/anthropic/claude-haiku-4-5"
-LOCAL_MODEL_DEFAULT = "ollama/qwen2.5:7b"    # enrichment + memory (fast, ~27 tok/s)
-JUDGE_MODEL_DEFAULT = "ollama/mistral-nemo"  # eval judge + supervisor (quality, ~16 tok/s)
-LOCAL_API_BASE      = os.getenv("NB_LOCAL_API_BASE", "http://host.docker.internal:11434").strip()
-LOCAL_LLM_BACKEND   = os.getenv("NB_LOCAL_LLM_BACKEND", "ollama").strip().lower()
+LOCAL_MODEL_DEFAULT = "qwen2.5-3b"      # llama.cpp local model alias (enrichment + memory)
+JUDGE_MODEL_DEFAULT = "qwen2.5-3b"      # supervisor/eval judge on local llama.cpp
+EMBED_MODEL_DEFAULT = "nomic-embed-text"  # semantic warm-tier search model (Ollama /api/embed)
+LOCAL_API_BASE      = os.getenv("NB_LOCAL_API_BASE", "http://127.0.0.1:8080").strip()
+LOCAL_LLM_BACKEND   = os.getenv("NB_LOCAL_LLM_BACKEND", "openai").strip().lower()
 LOCAL_API_KEY       = os.getenv("NB_LOCAL_API_KEY", "").strip()
+
+# --- Obsidian backup safety ---
+# Any write/edit targeting an Obsidian vault path is auto-backed up first.
+OBSIDIAN_BACKUP_DIR = os.path.expanduser(
+    os.getenv("NB_OBSIDIAN_BACKUP_DIR", "~/.nanobot/workspace/obsidian_backups")
+).strip()
+OBSIDIAN_BACKUP_RETENTION_DAYS = int(os.getenv("NB_OBSIDIAN_BACKUP_RETENTION_DAYS", "30"))
 
 # --- Agent limits ---
 MAX_TOKENS_DEFAULT    = 4096
@@ -33,10 +41,12 @@ MEMORY_CHUNK_FAIL_FAST_THRESHOLD = 2  # after N chunk summary failures, skip LLM
 
 # --- Timeouts (seconds) ---
 TIMEOUT_ENRICHMENT    = 10.0   # query enrichment          (enrichment.py)
+TIMEOUT_EMBED         =  5.0   # semantic embedding        (embeddings.py) — fast model, fail-fast
 TIMEOUT_CHUNK_SUMMARY = 20.0   # chunk summarization       (memory.py) — cloud, fast
 TIMEOUT_MEMORY_CONSOLIDATION = 60.0   # total consolidation budget per run
 TIMEOUT_WEB_FETCH     = 30.0   # HTTP fetch                (tools/web.py)
-TIMEOUT_JUDGE         = 60.0   # LLM-as-judge eval         (eval.py) — Nemo 12B needs headroom on cold start
+TIMEOUT_JUDGE         = 60.0   # LLM-as-judge eval         (eval.py) — keep headroom for local cold starts
+TIMEOUT_FLUSH         = 30.0   # local-LLM memory/todo flush timeout
 
 # --- Ollama keep-alive ---
 # -1 = keep model loaded in RAM indefinitely (never unload on idle)
@@ -45,12 +55,21 @@ OLLAMA_KEEP_ALIVE     = -1
 
 # --- Limits ---
 TOOL_RESULT_MAX_CHARS = 500    # tool output truncation    (loop.py)
+TOOL_RESULT_CONTEXT_MAX_CHARS = 1600  # max tool text injected back into model context
+MAX_CLOUD_INPUT_EST_TOKENS = 8000     # estimated prompt-token budget before cloud offload
+TARGET_CLOUD_INPUT_EST_TOKENS = 6500  # compaction target when budget is exceeded
+
+# --- Search behavior ---
+WEB_SEARCH_DEFAULT_COUNT = 3   # default results per query for web_search
+WEB_SEARCH_MAX_COUNT = 5       # hard cap unless deep-research mode is explicit
 
 # --- Memory tiering ---
 # MEMORY.md is capped at this many lines (hot tier).
 # When exceeded, the oldest ## section is moved to memory/topics/<slug>.md (warm tier).
-# Warm-tier files are keyword-matched against the user's message and loaded on demand.
-MEMORY_HOT_MAX_LINES = 200
+# Warm-tier files are matched by semantic similarity then keyword fallback.
+MEMORY_HOT_MAX_LINES   = 200
+SIMILARITY_THRESHOLD   = 0.50  # minimum cosine similarity to load warm-tier topic
+MEMORY_FLUSH_THRESHOLD = 18    # soft flush trigger before consolidation window slides
 
 # --- Supervisor / delegation ---
 DELEGATE_MAX_ITERATIONS = 15   # max LLM iterations per delegated worker

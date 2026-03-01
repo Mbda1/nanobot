@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import datetime
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -14,11 +15,14 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.enrichment import enrich_query
 from nanobot.agent.memory import MemoryStore
-from nanobot.agent.usage import init as _usage_init, record as _usage_record
+from nanobot.agent.usage import init as _usage_init, record as _usage_record, metric as _usage_metric
 from nanobot.config.constants import (
     CIRCUIT_BREAKER_CONSECUTIVE,
     CIRCUIT_BREAKER_PER_TOOL,
+    MAX_CLOUD_INPUT_EST_TOKENS,
+    TARGET_CLOUD_INPUT_EST_TOKENS,
     TOOL_RESULT_MAX_CHARS,
+    WEB_SEARCH_MAX_COUNT,
 )
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
@@ -204,9 +208,76 @@ class AgentLoop:
             return "running checks"
         return None
 
+    @staticmethod
+    def _detect_research_mode(text: str) -> str:
+        msg = (text or "").lower()
+        if any(k in msg for k in ("deep research", "exhaustive", "full research", "thorough research")):
+            return "deep"
+        if any(k in msg for k in ("quick", "cheap", "low cost", "minimal")):
+            return "cheap"
+        return "balanced"
+
+    @staticmethod
+    def _extract_text_for_estimate(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        parts.append(str(item.get("text", "")))
+                    elif item.get("type") == "image_url":
+                        parts.append("[image]")
+                    else:
+                        parts.append(str(item))
+                else:
+                    parts.append(str(item))
+            return "\n".join(parts)
+        return str(content)
+
+    @classmethod
+    def _estimate_messages_tokens(cls, messages: list[dict[str, Any]]) -> int:
+        # Lightweight estimate: roughly 1 token per 4 chars + per-message overhead.
+        chars = 0
+        for m in messages:
+            chars += len(cls._extract_text_for_estimate(m.get("content", "")))
+            if m.get("tool_calls"):
+                chars += len(json.dumps(m.get("tool_calls"), ensure_ascii=False))
+            chars += 32
+        return int(chars / 4)
+
+    @classmethod
+    def _compact_messages_for_budget(
+        cls,
+        messages: list[dict[str, Any]],
+        budget_tokens: int,
+        target_tokens: int,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        est = cls._estimate_messages_tokens(messages)
+        if est <= budget_tokens:
+            return messages, False
+
+        compact = list(messages)
+
+        # First pass: aggressively trim oversized tool messages.
+        for m in compact:
+            if m.get("role") != "tool":
+                continue
+            content = m.get("content")
+            if not isinstance(content, str):
+                continue
+            if len(content) > 700:
+                m["content"] = content[:700] + "\n... (compressed for cloud budget)"
+
+        # Do not drop whole history messages here. It can break provider-specific
+        # tool-use/tool-result chain invariants in persisted sessions.
+        return compact, True
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
+        research_mode: str = "balanced",
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
@@ -219,9 +290,32 @@ class AgentLoop:
         _tool_counts: dict[str, int] = {}
         _last_sig: str | None = None   # "tool_name:primary_arg" of last call
         _consecutive: int = 0          # consecutive identical-sig calls
+        _web_search_calls = 0
+        _web_search_limit = 2 if research_mode == "cheap" else 6 if research_mode == "deep" else 3
 
         while iteration < self.max_iterations:
             iteration += 1
+
+            est_before = self._estimate_messages_tokens(messages)
+            messages, was_compacted = self._compact_messages_for_budget(
+                messages,
+                budget_tokens=MAX_CLOUD_INPUT_EST_TOKENS,
+                target_tokens=TARGET_CLOUD_INPUT_EST_TOKENS,
+            )
+            est_after = self._estimate_messages_tokens(messages)
+            _usage_metric(
+                "cloud_preflight",
+                mode=research_mode,
+                estimated_tokens_before=est_before,
+                estimated_tokens_after=est_after,
+                compacted=was_compacted,
+                message_count=len(messages),
+            )
+            if was_compacted:
+                logger.warning(
+                    "Cloud preflight compaction applied (mode={}, est {} -> {} tokens)",
+                    research_mode, est_before, est_after,
+                )
 
             response = await self.provider.chat(
                 messages=messages,
@@ -231,6 +325,7 @@ class AgentLoop:
                 max_tokens=self.max_tokens,
             )
             _usage_record(self.model, response.usage, source="agent", latency_ms=response.latency_ms)
+            _usage_metric("turn_latency", latency_ms=response.latency_ms)
 
             if response.finish_reason == "error":
                 raise RuntimeError(response.content)
@@ -259,12 +354,13 @@ class AgentLoop:
                 )
 
                 # --- Phase 1: sequential — apply circuit breakers, decide what to run ---
-                # Results list: (tool_call, pre_computed_result | None)
+                # Results list: (tool_call, exec_args, pre_computed_result | None)
                 # None means "needs actual execution" (not blocked).
-                _call_plan: list[tuple[Any, str | None]] = []
+                _call_plan: list[tuple[Any, dict[str, Any], str | None]] = []
                 for tool_call in response.tool_calls:
                     name = tool_call.name
                     _tool_counts[name] = _tool_counts.get(name, 0) + 1
+                    exec_args = dict(tool_call.arguments or {})
 
                     primary = next(iter(tool_call.arguments.values()), "") if tool_call.arguments else ""
                     sig = f"{name}:{str(primary)[:60]}"
@@ -285,6 +381,22 @@ class AgentLoop:
                             f"called {_tool_counts[name]}× this turn "
                             f"(limit: {CIRCUIT_BREAKER_PER_TOOL})"
                         )
+                    elif name == "web_search":
+                        _web_search_calls += 1
+                        if _web_search_calls > _web_search_limit:
+                            breaker_reason = (
+                                f"web_search called {_web_search_calls}× this turn "
+                                f"(mode={research_mode}, limit={_web_search_limit})"
+                            )
+                        else:
+                            cap = WEB_SEARCH_MAX_COUNT if research_mode == "deep" else 3 if research_mode == "cheap" else 4
+                            try:
+                                req_count = int(exec_args.get("count", cap) or cap)
+                            except Exception:
+                                req_count = cap
+                            exec_args["count"] = min(max(req_count, 1), cap)
+                            if research_mode != "deep" and "provider" not in exec_args:
+                                exec_args["provider"] = "auto"
 
                     if breaker_reason:
                         logger.warning("Circuit breaker tripped: {} — {}", name, breaker_reason)
@@ -292,30 +404,36 @@ class AgentLoop:
                             f"Error: Circuit breaker tripped for '{name}' — {breaker_reason}. "
                             "Stop calling this tool and give a final answer with what you have."
                         )
-                        _call_plan.append((tool_call, blocked))
+                        _call_plan.append((tool_call, exec_args, blocked))
                     else:
                         tools_used.append(name)
                         logger.info("Tool call: {}({})", name,
-                                    json.dumps(tool_call.arguments, ensure_ascii=False)[:200])
-                        _call_plan.append((tool_call, None))
+                                    json.dumps(exec_args, ensure_ascii=False)[:200])
+                        _call_plan.append((tool_call, exec_args, None))
 
                 # --- Phase 2: parallel — execute non-blocked calls concurrently ---
-                _pending_idx = [i for i, (_, r) in enumerate(_call_plan) if r is None]
+                _pending_idx = [i for i, (_, _, r) in enumerate(_call_plan) if r is None]
                 if _pending_idx:
                     _results = await asyncio.gather(*[
-                        self.tools.execute(_call_plan[i][0].name, _call_plan[i][0].arguments)
+                        self.tools.execute(_call_plan[i][0].name, _call_plan[i][1])
                         for i in _pending_idx
                     ])
                     for idx, res in zip(_pending_idx, _results):
-                        _call_plan[idx] = (_call_plan[idx][0], res)
+                        _call_plan[idx] = (_call_plan[idx][0], _call_plan[idx][1], res)
 
                 # --- Phase 3: add all results to messages in original order ---
-                for tool_call, result in _call_plan:
+                for tool_call, _, result in _call_plan:
                     messages = self.context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
+                        messages, tool_call.id, tool_call.name, result, research_mode=research_mode
                     )
             else:
                 final_content = self._strip_think(response.content)
+                # Persist assistant text-only replies into session history.
+                messages = self.context.add_assistant_message(
+                    messages,
+                    final_content,
+                    reasoning_content=response.reasoning_content,
+                )
                 break
 
         if final_content is None and iteration >= self.max_iterations:
@@ -385,6 +503,234 @@ class AgentLoop:
         if not lock.locked():
             self._consolidation_locks.pop(session_key, None)
 
+    @staticmethod
+    def _extract_obi_directive(text: str) -> str | None:
+        m = re.match(r"^\s*obi\s*[-:]\s*(.+)$", text or "", flags=re.IGNORECASE | re.DOTALL)
+        if not m:
+            return None
+        return m.group(1).strip()
+
+    @staticmethod
+    def _slugify(text: str, max_len: int = 64) -> str:
+        s = re.sub(r"[^a-zA-Z0-9\s_-]", "", text or "").strip().lower()
+        s = re.sub(r"\s+", "-", s)
+        s = s.strip("-_")
+        return (s[:max_len] or "context-note")
+
+    @staticmethod
+    def _obi_notes_dir() -> Path:
+        return Path("/mnt/c/Users/Merim/Desktop/Merim_Personal/Bot Notes")
+
+    @staticmethod
+    def _extract_tags(text: str) -> list[str]:
+        tags: list[str] = []
+        for t in re.findall(r"#([A-Za-z0-9_-]+)", text or ""):
+            v = t.strip().lower()
+            if v and v not in tags:
+                tags.append(v)
+        return tags
+
+    def _build_obi_note(self, session: Session, directive: str, user_text: str, tags: list[str] | None = None) -> str:
+        recent = session.get_history(max_messages=14)
+        lines: list[str] = []
+        for m in recent:
+            role = str(m.get("role", "")).lower()
+            if role not in {"user", "assistant"}:
+                continue
+            content = m.get("content", "")
+            if not isinstance(content, str):
+                continue
+            content = content.strip()
+            if not content:
+                continue
+            tag = "User" if role == "user" else "Assistant"
+            lines.append(f"- **{tag}:** {content[:500]}")
+        excerpt = "\n".join(lines[-10:]) if lines else "- (no recent text context)"
+        tag_list = ["obi", "context"] + list(tags or [])
+        tag_list = [t for i, t in enumerate(tag_list) if t and t not in tag_list[:i]]
+        tags_yaml = ", ".join(tag_list)
+
+        ts = datetime.now()
+        return (
+            "---\n"
+            f"created: {ts.isoformat(timespec='seconds')}\n"
+            "agent: Obi\n"
+            f"tags: [{tags_yaml}]\n"
+            "---\n\n"
+            f"# Obi Note - {ts.strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"## Request\n{directive}\n\n"
+            "## Source Message\n"
+            f"{user_text}\n\n"
+            "## Recent Context\n"
+            f"{excerpt}\n"
+        )
+
+    def _save_obi_note(self, note_markdown: str, directive: str) -> Path:
+        notes_dir = self._obi_notes_dir()
+        notes_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now()
+        stem = self._slugify(directive.replace("save this context as a note", "").strip())
+        fname = f"{ts.strftime('%Y-%m-%d_%H%M%S')}_obi_{stem}.md"
+        path = notes_dir / fname
+        path.write_text(note_markdown, encoding="utf-8")
+        return path
+
+    def _find_obi_note(self, query: str) -> Path | None:
+        notes_dir = self._obi_notes_dir()
+        if not notes_dir.exists():
+            return None
+        q = self._slugify(query, max_len=120)
+        candidates = sorted(notes_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not q:
+            return candidates[0] if candidates else None
+        for p in candidates:
+            if q in self._slugify(p.stem, max_len=120):
+                return p
+        for p in candidates:
+            if query.lower().strip() in p.stem.lower():
+                return p
+        return candidates[0] if candidates else None
+
+    def _extract_obi_review_target(self, directive: str) -> str:
+        text = (directive or "").strip()
+        m = re.search(r"review\s+(.+?)\s+and\s+(?:optimi[sz]e links|improve linking)\s*$", text, flags=re.IGNORECASE)
+        if m:
+            target = m.group(1).strip().strip("\"'")
+            if target.lower() in {"this folder", "my folder", "vault", "my vault"}:
+                return str(self._obi_notes_dir())
+            return target
+        if "review this folder" in text.lower() or "improve linking" in text.lower():
+            return str(self._obi_notes_dir())
+        return str(self._obi_notes_dir())
+
+    def _append_to_obi_note(self, note_path: Path, text: str, title: str = "Obi Append") -> None:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        block = f"\n\n## {title} ({ts})\n{text.strip()}\n"
+        note_path.write_text(note_path.read_text(encoding="utf-8") + block, encoding="utf-8")
+
+    def _build_daily_summary(self, session: Session) -> str:
+        today = datetime.now().strftime("%Y-%m-%d")
+        recent = session.get_history(max_messages=24)
+        items: list[str] = []
+        for m in recent:
+            role = str(m.get("role", "")).lower()
+            if role not in {"user", "assistant"}:
+                continue
+            c = m.get("content", "")
+            if isinstance(c, str) and c.strip():
+                items.append(f"- **{role}**: {c.strip()[:220]}")
+        if not items:
+            items = ["- No recent context captured."]
+        return (
+            f"# Daily Note - {today}\n\n"
+            "## Summary\n"
+            "Auto-captured by Obi from recent conversation context.\n\n"
+            "## Timeline\n"
+            + "\n".join(items[-16:])
+            + "\n"
+        )
+
+    @staticmethod
+    def _normalize_wikilink_target(target: str) -> str:
+        t = target.strip()
+        if "|" in t:
+            t = t.split("|", 1)[0].strip()
+        if "#" in t:
+            t = t.split("#", 1)[0].strip()
+        return t
+
+    def _obi_review_and_optimize(self, target: str) -> str:
+        root = Path(target).expanduser()
+        if not root.exists() or not root.is_dir():
+            return f"Obi review failed: folder not found: {root}"
+
+        md_files = sorted(root.rglob("*.md"))
+        if not md_files:
+            return f"Obi review complete: no markdown files found in {root}"
+
+        # Index note names for deterministic link repair.
+        name_index: dict[str, list[str]] = {}
+        for p in md_files:
+            stem = p.stem.strip()
+            key = re.sub(r"[^a-z0-9]+", "", stem.lower())
+            name_index.setdefault(key, []).append(stem)
+
+        total_links = 0
+        broken_links = 0
+        fixed_links = 0
+        changed_files: list[str] = []
+        suggestions: list[str] = []
+
+        link_re = re.compile(r"\[\[([^\]]+)\]\]")
+
+        for p in md_files[:200]:
+            text = p.read_text(encoding="utf-8", errors="replace")
+            original = text
+
+            def _replace(m: re.Match[str]) -> str:
+                nonlocal total_links, broken_links, fixed_links
+                raw = m.group(1)
+                target_raw = self._normalize_wikilink_target(raw)
+                total_links += 1
+                if not target_raw:
+                    return m.group(0)
+
+                candidate = root / f"{target_raw}.md"
+                if candidate.exists():
+                    return m.group(0)
+
+                key = re.sub(r"[^a-z0-9]+", "", target_raw.lower())
+                matches = name_index.get(key, [])
+                if len(matches) == 1:
+                    fixed_links += 1
+                    repaired = raw.replace(target_raw, matches[0], 1)
+                    return f"[[{repaired}]]"
+
+                broken_links += 1
+                return m.group(0)
+
+            text = link_re.sub(_replace, text)
+
+            # Add a small Related section if missing and there are clear parent notes.
+            if "## Related" not in text and p.parent != root:
+                parent_note = p.parent.name.replace("_", " ").replace("-", " ").strip()
+                parent_key = re.sub(r"[^a-z0-9]+", "", parent_note.lower())
+                parent_matches = name_index.get(parent_key, [])
+                if parent_matches:
+                    text += f"\n\n## Related\n- [[{parent_matches[0]}]]\n"
+
+            if text != original:
+                p.write_text(text, encoding="utf-8")
+                changed_files.append(str(p))
+
+        if len(md_files) > 200:
+            suggestions.append(f"Scanned first 200/{len(md_files)} markdown files; run again for full pass.")
+        if broken_links > 0:
+            suggestions.append(f"{broken_links} unresolved links remain (ambiguous or missing targets).")
+        if not suggestions:
+            suggestions.append("No further action needed in this pass.")
+
+        report = (
+            f"Obi local review complete for {root}\n"
+            f"- markdown files scanned: {min(len(md_files), 200)}\n"
+            f"- links analyzed: {total_links}\n"
+            f"- links auto-fixed: {fixed_links}\n"
+            f"- unresolved links: {broken_links}\n"
+            f"- files changed: {len(changed_files)}\n"
+            f"- suggestions: {' '.join(suggestions)}"
+        )
+
+        report_path = root / f"OBI_AUDIT_{datetime.now().strftime('%Y-%m-%d')}.md"
+        changed_preview = "\n".join(f"- {Path(f).name}" for f in changed_files[:30]) or "- none"
+        report_body = (
+            f"# Obi Audit {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"{report}\n\n"
+            "## Changed Files\n"
+            f"{changed_preview}\n"
+        )
+        report_path.write_text(report_body, encoding="utf-8")
+        return f"{report}\n- audit report: {report_path}"
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -401,12 +747,15 @@ class AgentLoop:
             session = self.sessions.get_or_create(key)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=self.memory_window)
+            research_mode = self._detect_research_mode(msg.content)
+            response_style = "default" if research_mode == "deep" else "simple_first"
             messages = await self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
+                response_style=response_style,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
-            self._save_turn(session, all_msgs, 1 + len(history))
+            final_content, _, all_msgs = await self._run_agent_loop(messages, research_mode=research_mode)
+            self._save_turn(session, all_msgs, len(messages))
             self.sessions.save(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
@@ -416,6 +765,75 @@ class AgentLoop:
 
         key = session_key or msg.session_key
         session = self.sessions.get_or_create(key)
+
+        obi_directive = self._extract_obi_directive(msg.content)
+        if obi_directive:
+            lower = obi_directive.lower()
+            tags = self._extract_tags(obi_directive)
+
+            if "review" in lower and ("optimize links" in lower or "improve linking" in lower):
+                target = self._extract_obi_review_target(obi_directive)
+                result = self._obi_review_and_optimize(target)
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=f"Obi review complete for `{target}`:\n\n{result}",
+                    metadata=msg.metadata or {},
+                )
+
+            if "append to note" in lower:
+                target = re.split(r"append to note", obi_directive, flags=re.IGNORECASE, maxsplit=1)[-1].strip(" :\"'")
+                note = self._find_obi_note(target)
+                if not note:
+                    return OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content="Obi could not find a matching note to append to.",
+                        metadata=msg.metadata or {},
+                    )
+                note_md = self._build_obi_note(session, obi_directive, msg.content, tags=tags)
+                self._append_to_obi_note(note, note_md, title="Obi Appended Context")
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=f"Done. Obi appended context to:\n{note}",
+                    metadata=msg.metadata or {},
+                )
+
+            if "summarize today" in lower and "daily note" in lower:
+                notes_dir = self._obi_notes_dir() / "Daily"
+                notes_dir.mkdir(parents=True, exist_ok=True)
+                day_file = notes_dir / f"{datetime.now().strftime('%Y-%m-%d')}.md"
+                summary = self._build_daily_summary(session)
+                if day_file.exists():
+                    self._append_to_obi_note(day_file, summary, title="Obi Daily Summary")
+                else:
+                    day_file.write_text(summary, encoding="utf-8")
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=f"Saved. Obi updated daily note:\n{day_file}",
+                    metadata=msg.metadata or {},
+                )
+
+            if "tag this" in lower:
+                note_md = self._build_obi_note(session, obi_directive, msg.content, tags=tags)
+                note_path = self._save_obi_note(note_md, obi_directive)
+                tag_msg = ", ".join(f"#{t}" for t in tags) if tags else "(no tags detected)"
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=f"Saved and tagged {tag_msg}:\n{note_path}",
+                    metadata=msg.metadata or {},
+                )
+
+            if "save" in lower and "note" in lower:
+                note_md = self._build_obi_note(session, obi_directive, msg.content, tags=tags)
+                note_path = self._save_obi_note(note_md, obi_directive)
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content=(
+                        f"Saved. Obi wrote a note:\n{note_path}\n\n"
+                        "Want more? 1) Deep analysis 2) Structured summary 3) Sources only"
+                    ),
+                    metadata=msg.metadata or {},
+                )
 
         # Slash commands
         cmd = msg.content.strip().lower()
@@ -477,12 +895,15 @@ class AgentLoop:
                 message_tool.start_turn()
 
         history = session.get_history(max_messages=self.memory_window)
+        research_mode = self._detect_research_mode(msg.content)
+        response_style = "default" if research_mode == "deep" else "simple_first"
         enriched_content = await enrich_query(self.provider, self.local_model, msg.content)
         initial_messages = await self.context.build_messages(
             history=history,
             current_message=enriched_content,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
+            response_style=response_style,
         )
 
         progress_state = {
@@ -547,12 +968,12 @@ class AgentLoop:
                 )
 
         if progress_enabled:
-            await _emit_progress("Working on it now. This can take a few minutes for deep research.")
+            await _emit_progress("I'm working on it...")
             progress_task = asyncio.create_task(_heartbeat_loop())
 
         try:
             final_content, _, all_msgs = await self._run_agent_loop(
-                initial_messages, on_progress=on_progress or _bus_progress,
+                initial_messages, research_mode=research_mode, on_progress=on_progress or _bus_progress,
             )
         finally:
             if progress_task:
@@ -568,7 +989,7 @@ class AgentLoop:
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        self._save_turn(session, all_msgs, 1 + len(history))
+        self._save_turn(session, all_msgs, len(initial_messages))
         self.sessions.save(session)
 
         if message_tool := self.tools.get("message"):
