@@ -1,8 +1,11 @@
 """Context builder for assembling agent prompts."""
 
 import base64
+import inspect
+import json
 import mimetypes
 import platform
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +13,7 @@ from typing import Any
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
+from nanobot.config.constants import TOOL_RESULT_CONTEXT_MAX_CHARS
 
 
 class ContextBuilder:
@@ -37,7 +41,7 @@ class ContextBuilder:
 
         Args:
             skill_names: Optional list of skills to include.
-            user_message: Current user message — used for warm-tier topic matching.
+            user_message: Current user message — used for warm-tier keyword matching.
 
         Returns:
             Complete system prompt.
@@ -52,8 +56,10 @@ class ContextBuilder:
         if bootstrap:
             parts.append(bootstrap)
 
-        # Memory context (hot tier always + warm tier on semantic/keyword match)
-        memory = await self.memory.get_memory_context(user_message)
+        # Memory context (hot tier always + warm tier on keyword match)
+        memory = self.memory.get_memory_context(user_message)
+        if inspect.isawaitable(memory):
+            memory = await memory
         if memory:
             parts.append(f"# Memory\n\n{memory}")
         
@@ -147,6 +153,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        response_style: str = "default",
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -168,9 +175,19 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         msg_text = current_message if isinstance(current_message, str) else ""
         system_prompt = await self.build_system_prompt(skill_names, user_message=msg_text)
         messages.append({"role": "system", "content": system_prompt})
+        if response_style == "simple_first":
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Response style policy: Start with a concise direct answer first. "
+                    "Do not begin with a long structured brief unless the user explicitly asks for deep research. "
+                    "After the direct answer, append exactly one line:\n"
+                    "\"Want more? 1) Deep analysis 2) Structured summary 3) Sources only\""
+                ),
+            })
 
-        # History
-        messages.extend(history)
+        # History (sanitize stale/orphaned tool chain artifacts)
+        messages.extend(self._sanitize_history_for_tool_chains(history))
 
         # Current message (with optional image attachments)
         user_content = self._build_user_content(current_message, media)
@@ -178,6 +195,34 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         messages.append({"role": "user", "content": user_content})
 
         return messages
+
+    @staticmethod
+    def _sanitize_history_for_tool_chains(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop orphan tool results that no longer have a matching prior tool call envelope."""
+        out: list[dict[str, Any]] = []
+        pending_tool_ids: set[str] = set()
+        for m in history:
+            role = m.get("role")
+            if role == "assistant" and m.get("tool_calls"):
+                ids = set()
+                for tc in (m.get("tool_calls") or []):
+                    try:
+                        ids.add(str(tc.get("id", "")))
+                    except Exception:
+                        continue
+                pending_tool_ids = {x for x in ids if x}
+                out.append(m)
+                continue
+            if role == "tool":
+                tcid = str(m.get("tool_call_id", "")).strip()
+                if tcid and tcid in pending_tool_ids:
+                    out.append(m)
+                    pending_tool_ids.discard(tcid)
+                # else: orphan tool result; drop it
+                continue
+            pending_tool_ids.clear()
+            out.append(m)
+        return out
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""
@@ -202,7 +247,8 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         messages: list[dict[str, Any]],
         tool_call_id: str,
         tool_name: str,
-        result: str
+        result: str,
+        research_mode: str = "balanced",
     ) -> list[dict[str, Any]]:
         """
         Add a tool result to the message list.
@@ -216,13 +262,96 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         Returns:
             Updated message list.
         """
+        compact = self._compact_tool_result(tool_name, result, research_mode=research_mode)
         messages.append({
             "role": "tool",
             "tool_call_id": tool_call_id,
             "name": tool_name,
-            "content": result
+            "content": compact
         })
         return messages
+
+    @staticmethod
+    def _compact_tool_result(tool_name: str, content: str, research_mode: str = "balanced") -> str:
+        """Keep tool outputs compact before they are sent back to the cloud model."""
+        if not isinstance(content, str):
+            return str(content)
+        name = (tool_name or "").strip().lower()
+        raw = content.strip()
+        if not raw:
+            return raw
+
+        if name == "web_search":
+            compact = ContextBuilder._compact_web_search(raw, research_mode=research_mode)
+        elif name == "web_fetch":
+            compact = ContextBuilder._compact_web_fetch(raw, research_mode=research_mode)
+        else:
+            compact = raw
+
+        if len(compact) > TOOL_RESULT_CONTEXT_MAX_CHARS:
+            compact = compact[:TOOL_RESULT_CONTEXT_MAX_CHARS] + "\n... (truncated for context budget)"
+        return compact
+
+    @staticmethod
+    def _compact_web_search(text: str, research_mode: str = "balanced") -> str:
+        m = re.search(r"Results for:\s*(.+?)(?:\s+\(provider=(\w+)\))?\s*$", text.splitlines()[0] if text else "")
+        query = m.group(1) if m else ""
+        provider = (m.group(2) if m else None) or "unknown"
+
+        max_items = 2 if research_mode == "cheap" else 4 if research_mode == "deep" else 3
+        lines = text.splitlines()
+        items: list[tuple[str, str, str]] = []
+        cur_title = ""
+        cur_url = ""
+        cur_snip = ""
+        for ln in lines[1:]:
+            s = ln.strip()
+            if re.match(r"^\d+\.\s+", s):
+                if cur_title or cur_url:
+                    items.append((cur_title, cur_url, cur_snip))
+                cur_title = re.sub(r"^\d+\.\s+", "", s).strip()
+                cur_url = ""
+                cur_snip = ""
+            elif s.startswith("http://") or s.startswith("https://"):
+                cur_url = s
+            elif s:
+                cur_snip = (cur_snip + " " + s).strip()
+        if cur_title or cur_url:
+            items.append((cur_title, cur_url, cur_snip))
+
+        out = [f"[EVIDENCE:web_search provider={provider}]"]
+        if query:
+            out.append(f"query: {query}")
+        for i, (title, url, snip) in enumerate(items[:max_items], 1):
+            out.append(f"{i}. {title}")
+            if url:
+                out.append(f"   url: {url}")
+            if snip:
+                out.append(f"   fact: {snip[:220]}")
+        if len(items) > max_items:
+            out.append(f"... {len(items) - max_items} additional results omitted")
+        return "\n".join(out)
+
+    @staticmethod
+    def _compact_web_fetch(text: str, research_mode: str = "balanced") -> str:
+        try:
+            data = json.loads(text)
+        except Exception:
+            data = None
+        if not isinstance(data, dict):
+            return text
+
+        max_excerpt = 600 if research_mode == "cheap" else 1400 if research_mode == "deep" else 900
+        src = data.get("finalUrl") or data.get("url") or ""
+        body = str(data.get("text", "")).strip()
+        excerpt = body[:max_excerpt]
+        return "\n".join([
+            "[EVIDENCE:web_fetch]",
+            f"url: {src}",
+            f"status: {data.get('status', '?')}",
+            f"extractor: {data.get('extractor', '?')}",
+            f"excerpt:\n{excerpt}",
+        ])
     
     def add_assistant_message(
         self,

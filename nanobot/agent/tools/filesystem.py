@@ -1,10 +1,13 @@
 """File system tools: read, write, edit."""
 
 import difflib
+import shutil
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
+from nanobot.config.constants import OBSIDIAN_BACKUP_DIR, OBSIDIAN_BACKUP_RETENTION_DAYS
 
 
 def _resolve_path(path: str, workspace: Path | None = None, allowed_dir: Path | None = None) -> Path:
@@ -19,6 +22,45 @@ def _resolve_path(path: str, workspace: Path | None = None, allowed_dir: Path | 
         except ValueError:
             raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
     return resolved
+
+
+def _is_obsidian_target(path: Path) -> bool:
+    """Return True if path appears to be inside an Obsidian-style vault."""
+    parts = {p.lower() for p in path.parts}
+    return "obsidian vault" in parts or "bot notes" in parts
+
+
+def _backup_before_modify(path: Path) -> str | None:
+    """Create a timestamped backup copy before modifying an existing file."""
+    if not path.exists() or not path.is_file():
+        return None
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    backup_root = Path(OBSIDIAN_BACKUP_DIR).expanduser()
+    safe_rel = str(path).replace(":", "").lstrip("/").replace("\\", "/")
+    backup_dir = backup_root / Path(safe_rel).parent
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_path = backup_dir / f"{path.name}.{stamp}.bak"
+    shutil.copy2(path, backup_path)
+    return str(backup_path)
+
+
+def _cleanup_old_backups() -> int:
+    """Delete backup files older than retention window."""
+    backup_root = Path(OBSIDIAN_BACKUP_DIR).expanduser()
+    if not backup_root.exists():
+        return 0
+    cutoff = datetime.now() - timedelta(days=OBSIDIAN_BACKUP_RETENTION_DAYS)
+    removed = 0
+    for f in backup_root.rglob("*.bak"):
+        try:
+            mtime = datetime.fromtimestamp(f.stat().st_mtime)
+            if mtime < cutoff:
+                f.unlink()
+                removed += 1
+        except Exception:
+            continue
+    return removed
 
 
 class ReadFileTool(Tool):
@@ -100,9 +142,18 @@ class WriteFileTool(Tool):
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
             file_path = _resolve_path(path, self._workspace, self._allowed_dir)
+            backup_path = None
+            if _is_obsidian_target(file_path):
+                backup_path = _backup_before_modify(file_path)
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content, encoding="utf-8")
-            return f"Successfully wrote {len(content)} bytes to {file_path}"
+            removed = _cleanup_old_backups() if _is_obsidian_target(file_path) else 0
+            msg = f"Successfully wrote {len(content)} bytes to {file_path}"
+            if backup_path:
+                msg += f"\nBackup: {backup_path}"
+            if removed:
+                msg += f"\nCleanup: removed {removed} old backups"
+            return msg
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:
@@ -161,10 +212,19 @@ class EditFileTool(Tool):
             if count > 1:
                 return f"Warning: old_text appears {count} times. Please provide more context to make it unique."
 
+            backup_path = None
+            if _is_obsidian_target(file_path):
+                backup_path = _backup_before_modify(file_path)
             new_content = content.replace(old_text, new_text, 1)
             file_path.write_text(new_content, encoding="utf-8")
 
-            return f"Successfully edited {file_path}"
+            removed = _cleanup_old_backups() if _is_obsidian_target(file_path) else 0
+            msg = f"Successfully edited {file_path}"
+            if backup_path:
+                msg += f"\nBackup: {backup_path}"
+            if removed:
+                msg += f"\nCleanup: removed {removed} old backups"
+            return msg
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:

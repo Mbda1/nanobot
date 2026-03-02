@@ -1,8 +1,4 @@
-"""Lightweight token-usage and metrics logger.
-
-USAGE.jsonl  — one JSON line per LLM call (tokens + latency)
-METRICS.jsonl — one JSON line per instrumentation event (warm hits, turn latency)
-"""
+"""Lightweight token-usage logger. Appends one JSON line per LLM call to USAGE.jsonl."""
 
 from __future__ import annotations
 
@@ -20,18 +16,7 @@ def init(workspace: Path) -> None:
     _log_path = workspace / "memory" / "USAGE.jsonl"
     _log_path.parent.mkdir(parents=True, exist_ok=True)
     _metrics_path = workspace / "memory" / "METRICS.jsonl"
-
-
-def record_metric(event: str, **kwargs) -> None:
-    """Append one instrumentation event to METRICS.jsonl. Silent no-op if not initialised."""
-    if not _metrics_path:
-        return
-    entry = {"ts": datetime.now().isoformat(timespec="seconds"), "event": event, **kwargs}
-    try:
-        with open(_metrics_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
+    _metrics_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def record(model: str, usage: dict, source: str = "agent", latency_ms: int = 0) -> None:
@@ -49,3 +34,18 @@ def record(model: str, usage: dict, source: str = "agent", latency_ms: int = 0) 
     }
     with open(_log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
+
+
+def metric(event: str, **fields) -> None:
+    """Append a lightweight metrics event to METRICS.jsonl."""
+    if not _metrics_path:
+        return
+    entry = {"ts": datetime.now().isoformat(timespec="seconds"), "event": event}
+    entry.update(fields)
+    with open(_metrics_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def record_metric(event: str, **fields) -> None:
+    """Backward-compatible alias used by existing callers."""
+    metric(event, **fields)
