@@ -47,24 +47,26 @@ async def test_per_tool_breaker_trips(tmp_path):
     """After CIRCUIT_BREAKER_PER_TOOL calls, further calls are blocked.
 
     Uses distinct args each time so the consecutive breaker doesn't fire first.
+    Uses 'exec' (not 'web_search') to avoid the web_search-specific limit (3/balanced)
+    which fires before CIRCUIT_BREAKER_PER_TOOL (5).
     """
     loop = _make_loop(tmp_path)
 
     # PER_TOOL calls with unique args (no consecutive trigger), then one more (trips), then text.
     responses = (
-        [_tool_response("web_search", f"query-{i}", f"c{i}") for i in range(CIRCUIT_BREAKER_PER_TOOL + 1)]
+        [_tool_response("exec", f"cmd-{i}", f"c{i}") for i in range(CIRCUIT_BREAKER_PER_TOOL + 1)]
         + [_text_response("all done")]
     )
     loop.provider.chat.side_effect = responses
 
-    execute_mock = AsyncMock(return_value="search result")
-    loop.tools._tools["web_search"] = MagicMock(
-        name="web_search",
+    execute_mock = AsyncMock(return_value="ok")
+    loop.tools._tools["exec"] = MagicMock(
+        name="exec",
         validate_params=MagicMock(return_value=[]),
         execute=execute_mock,
     )
 
-    messages = [{"role": "user", "content": "search for stuff"}]
+    messages = [{"role": "user", "content": "run stuff"}]
     final_content, tools_used, _ = await loop._run_agent_loop(messages)
 
     # Tool should have been called exactly PER_TOOL times (the extra call is blocked).
@@ -132,24 +134,25 @@ async def test_no_trip_under_limit(tmp_path):
     """Tools called fewer than the limit execute without interference.
 
     Uses distinct args each time so neither breaker fires.
+    Uses 'exec' (not 'web_search') to avoid the web_search-specific limit.
     """
     loop = _make_loop(tmp_path)
 
     calls = CIRCUIT_BREAKER_PER_TOOL - 1
     responses = (
-        [_tool_response("web_search", f"q-{i}", f"c{i}") for i in range(calls)]
+        [_tool_response("exec", f"cmd-{i}", f"c{i}") for i in range(calls)]
         + [_text_response("ok")]
     )
     loop.provider.chat.side_effect = responses
 
     execute_mock = AsyncMock(return_value="result")
-    loop.tools._tools["web_search"] = MagicMock(
-        name="web_search",
+    loop.tools._tools["exec"] = MagicMock(
+        name="exec",
         validate_params=MagicMock(return_value=[]),
         execute=execute_mock,
     )
 
-    messages = [{"role": "user", "content": "search"}]
+    messages = [{"role": "user", "content": "run stuff"}]
     final_content, _, _ = await loop._run_agent_loop(messages)
 
     assert execute_mock.call_count == calls

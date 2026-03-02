@@ -55,7 +55,8 @@ def test_delegate_tool_schema():
     assert tool.name == "delegate"
     assert "task" in tool.parameters["required"]
     roles = tool.parameters["properties"]["role"]["enum"]
-    assert set(roles) == {"researcher", "writer", "analyst", "coder", "general"}
+    # "curator" routes to local model (Obi), included alongside cloud-only roles
+    assert set(roles) == {"researcher", "writer", "analyst", "coder", "curator", "general"}
 
 
 # ---------------------------------------------------------------------------
@@ -141,12 +142,16 @@ async def test_parallel_execution_of_delegate_batch(tmp_path):
 
 @pytest.mark.asyncio
 async def test_circuit_breaker_preserved_with_parallel(tmp_path):
-    """Circuit breaker bookkeeping is still correct when batch execution runs in parallel."""
+    """Circuit breaker bookkeeping is still correct when batch execution runs in parallel.
+
+    Uses 'exec' (not 'web_search') to avoid the web_search-specific limit (3/balanced)
+    which would trip before CIRCUIT_BREAKER_PER_TOOL (5).
+    """
     loop = _make_loop(tmp_path)
 
     execute_mock = AsyncMock(return_value="result")
-    loop.tools._tools["web_search"] = MagicMock(
-        name="web_search",
+    loop.tools._tools["exec"] = MagicMock(
+        name="exec",
         validate_params=MagicMock(return_value=[]),
         execute=execute_mock,
     )
@@ -156,7 +161,7 @@ async def test_circuit_breaker_preserved_with_parallel(tmp_path):
     responses = (
         [
             LLMResponse(content=None, tool_calls=[
-                ToolCallRequest(id=f"c{i}", name="web_search", arguments={"query": f"q{i}"})
+                ToolCallRequest(id=f"c{i}", name="exec", arguments={"command": f"cmd{i}"})
             ])
             for i in range(CIRCUIT_BREAKER_PER_TOOL + 1)
         ]
@@ -164,7 +169,7 @@ async def test_circuit_breaker_preserved_with_parallel(tmp_path):
     )
     loop.provider.chat.side_effect = responses
 
-    await loop._run_agent_loop([{"role": "user", "content": "search"}])
+    await loop._run_agent_loop([{"role": "user", "content": "run stuff"}])
     # Only PER_TOOL executions should have happened
     assert execute_mock.call_count == CIRCUIT_BREAKER_PER_TOOL
 
