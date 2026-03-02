@@ -12,6 +12,19 @@ MEMORY_WINDOW = 50
 KEEP_COUNT = MEMORY_WINDOW // 2  # 25
 
 
+def create_alternating_session(key: str, count: int) -> Session:
+    """Create a session with alternating user/assistant messages labelled msg0..msgN-1.
+
+    get_history() collapses consecutive same-role messages, so tests that check
+    specific history lengths must use alternating roles.
+    """
+    session = Session(key=key)
+    for i in range(count):
+        role = "user" if i % 2 == 0 else "assistant"
+        session.add_message(role, f"msg{i}")
+    return session
+
+
 def create_session_with_messages(key: str, count: int, role: str = "user") -> Session:
     """Create a session and add the specified number of messages.
 
@@ -116,7 +129,8 @@ class TestSessionImmutableHistory:
 
     def test_get_history_with_all_messages(self) -> None:
         """Test get_history with max_messages larger than actual."""
-        session = create_session_with_messages("test:all", 5)
+        # Use alternating roles — get_history() collapses consecutive same-role messages.
+        session = create_alternating_session("test:all", 5)
         history = session.get_history(max_messages=100)
         assert len(history) == 5
         assert history[0]["content"] == "msg0"
@@ -160,7 +174,8 @@ class TestSessionPersistence:
 
     def test_get_history_after_reload(self, temp_manager):
         """Test that get_history works correctly after reload."""
-        session1 = create_session_with_messages("test:reload", 30)
+        # Use alternating roles so consecutive-user collapse doesn't shrink the result.
+        session1 = create_alternating_session("test:reload", 30)
         temp_manager.save(session1)
 
         session2 = temp_manager.get_or_create("test:reload")
@@ -334,7 +349,8 @@ class TestCacheImmutability:
 
     def test_get_history_does_not_modify_messages(self):
         """Test that get_history doesn't modify messages list."""
-        session = create_session_with_messages("test:history_immutable", 40)
+        # Use alternating roles so consecutive-user collapse doesn't shrink history.
+        session = create_alternating_session("test:history_immutable", 40)
         original_messages = [m.copy() for m in session.messages]
 
         for _ in range(5):
